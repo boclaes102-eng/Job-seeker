@@ -1,0 +1,10 @@
+{
+  "name": "job-seeker",
+  "private": true,
+  "scripts": {
+    "dev:client": "cd client && npm run dev",
+    "dev:server": "cd server && go run ./cmd/server",
+    "build:client": "cd client && npm run build",
+    "build:server": "cd server && go build -o server.exe ./cmd/server"
+  }
+}
