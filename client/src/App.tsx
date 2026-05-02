@@ -1,14 +1,15 @@
 import { useEffect, useState, useCallback, useRef } from 'react'
 import type { Job, JobStatus } from './types/job'
-import { fetchJobs, updateStatus, analyzeJob, resetJobs, clearNewJobs } from './api/client'
+import { fetchJobs, updateStatus, analyzeJob, resetJobs } from './api/client'
 import { JobCard } from './components/JobCard'
 import { FilterBar, type DateRange } from './components/FilterBar'
 import { SourceTabs } from './components/SourceTabs'
 import { ProfileEditor } from './components/ProfileEditor'
 import { PipelineView } from './components/PipelineView'
+import { IgnoredView } from './components/IgnoredView'
 import { RefreshProgress } from './components/RefreshProgress'
 
-type Tab = 'jobs' | 'pipeline' | 'profile'
+type Tab = 'jobs' | 'pipeline' | 'profile' | 'ignored'
 type RefreshPhase = 'scraping' | 'scoring' | 'done'
 
 interface Progress {
@@ -22,19 +23,6 @@ interface Progress {
   errors: string[]
 }
 
-function applyDateFilter(jobs: Job[], range: DateRange): Job[] {
-  if (range === 'all') return jobs
-  const now = Date.now()
-  const ms: Record<DateRange, number> = {
-    all: Infinity,
-    today: 24 * 60 * 60 * 1000,
-    '3days': 3 * 24 * 60 * 60 * 1000,
-    week: 7 * 24 * 60 * 60 * 1000,
-    month: 30 * 24 * 60 * 60 * 1000,
-  }
-  const cutoff = now - ms[range]
-  return jobs.filter(j => new Date(j.postedAt).getTime() >= cutoff)
-}
 
 export default function App() {
   const [tab, setTab] = useState<Tab>('jobs')
@@ -57,11 +45,6 @@ export default function App() {
 
   async function handleRefresh() {
     if (esRef.current) esRef.current.close()
-    // When jobs already exist, silently clear old new-status jobs first
-    if (allJobs.length > 0) {
-      await clearNewJobs()
-      setAllJobs(prev => prev.filter(j => j.status !== 'new'))
-    }
     setProgress({ phase: 'scraping', scraped: 0, totalScrapes: 0, scored: 0, totalToScore: 0, currentJob: '', log: [], errors: [] })
 
     const params = new URLSearchParams({ sources: selectedSources.join(','), radius: String(radius), dateRange, maxJobs: String(maxJobs) })
@@ -75,7 +58,6 @@ export default function App() {
       if (ev.type === 'done') {
         es.close()
         setProgress(prev => prev ? { ...prev, phase: 'done', currentJob: '' } : prev)
-        setDateRange('all') // backend already filtered by date — show everything returned
         loadJobs()
         return
       }
@@ -134,15 +116,14 @@ export default function App() {
     }
   }
 
-  // Apply all display filters client-side
+  // Source tab filters the display; all other filters are scraping-only params
   const bySource = viewSource ? allJobs.filter(j => j.source === viewSource) : allJobs
-  const byDate = applyDateFilter(bySource, dateRange)
-  const sorted = [...byDate].sort((a, b) => b.matchScore - a.matchScore || new Date(b.fetchedAt).getTime() - new Date(a.fetchedAt).getTime())
+  const sorted = [...bySource].sort((a, b) => b.matchScore - a.matchScore || new Date(b.fetchedAt).getTime() - new Date(a.fetchedAt).getTime())
 
   const counts: Record<string, number> = {
-    '': applyDateFilter(allJobs, dateRange).length,
-    adzuna: applyDateFilter(allJobs.filter(j => j.source === 'adzuna'), dateRange).length,
-    linkedin: applyDateFilter(allJobs.filter(j => j.source === 'linkedin'), dateRange).length,
+    '': allJobs.length,
+    adzuna: allJobs.filter(j => j.source === 'adzuna').length,
+    linkedin: allJobs.filter(j => j.source === 'linkedin').length,
   }
 
   const isRefreshing = progress !== null && progress.phase !== 'done'
@@ -155,13 +136,13 @@ export default function App() {
           <p className="text-xs text-gray-400">Bo Claes · Belgium</p>
         </div>
         <nav className="flex gap-1">
-          {(['jobs', 'pipeline', 'profile'] as Tab[]).map(t => (
+          {(['jobs', 'pipeline', 'ignored', 'profile'] as Tab[]).map(t => (
             <button
               key={t}
               onClick={() => setTab(t)}
               className={`px-4 py-1.5 rounded-lg text-sm font-medium transition-colors ${tab === t ? 'bg-indigo-600 text-white' : 'text-gray-500 hover:bg-gray-100'}`}
             >
-              {t === 'jobs' ? `Jobs (${sorted.length})` : t === 'pipeline' ? 'Pipeline' : 'My Profile'}
+              {t === 'jobs' ? `Jobs (${sorted.length})` : t === 'pipeline' ? 'Pipeline' : t === 'ignored' ? 'Ignored' : 'My Profile'}
             </button>
           ))}
         </nav>
@@ -222,6 +203,7 @@ export default function App() {
         )}
 
         {tab === 'pipeline' && <PipelineView />}
+        {tab === 'ignored' && <IgnoredView onRestore={loadJobs} />}
         {tab === 'profile' && <ProfileEditor />}
       </main>
     </div>

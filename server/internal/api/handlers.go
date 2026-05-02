@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -164,6 +166,7 @@ func (h *Handler) RefreshJobsStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	totalScrapes := len(cfg.Queries) * len(wantSources)
+	slog.Info("refresh.start", "sources", wantSources, "queries", len(cfg.Queries), "radius_km", radius, "max_jobs", maxJobs, "max_days_old", maxDaysOld)
 	send(sseEvent{Type: "scrape_start", Total: totalScrapes})
 
 	// --- Phase 1: scrape selected sources concurrently ---
@@ -176,15 +179,18 @@ func (h *Handler) RefreshJobsStream(w http.ResponseWriter, r *http.Request) {
 
 	ch := make(chan scrapeResult, totalScrapes)
 
-	// LinkedIn: all queries fire concurrently
-	for _, q := range cfg.Queries {
-		q := q
-		if wantSources["linkedin"] {
-			go func() {
+	// LinkedIn: sequential with a short delay to avoid 429 rate-limiting.
+	// Firing all 30 goroutines at once reliably triggers LinkedIn's bot detection.
+	if wantSources["linkedin"] {
+		go func() {
+			for i, q := range cfg.Queries {
+				if i > 0 {
+					time.Sleep(500 * time.Millisecond)
+				}
 				jobs, err := scrapers.NewLinkedIn(q, cfg.Location, cfg.City, radius, maxDaysOld).Fetch()
 				ch <- scrapeResult{"linkedin", q, jobs, err}
-			}()
-		}
+			}
+		}()
 	}
 
 	// Adzuna: sequential with delay to respect trial rate limits
@@ -228,37 +234,58 @@ func (h *Handler) RefreshJobsStream(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Balance: cap at maxJobs (0 = no limit), taking proportionally from each query bucket
-	numQueries := len(queryJobs)
+	// Sort each query bucket by recency (newest first) so we pick fresh jobs first
+	for q, jobs := range queryJobs {
+		sort.Slice(jobs, func(i, j int) bool {
+			return jobs[i].PostedAt.After(jobs[j].PostedAt)
+		})
+		queryJobs[q] = jobs
+	}
+
+	// Build stable query order for round-robin
+	queryOrder := make([]string, 0, len(queryJobs))
+	for q := range queryJobs {
+		queryOrder = append(queryOrder, q)
+	}
+	sort.Strings(queryOrder)
+
+	// Select jobs: round-robin across query buckets to maximise diversity.
+	// Each pass takes 1 job from each bucket (the freshest not yet taken).
+	// Stops when maxJobs is reached or all buckets are exhausted.
 	var unique []*models.Job
-	if numQueries > 0 {
-		if maxJobs > 0 {
-			perQuery := maxJobs / numQueries
-			if perQuery < 1 {
-				perQuery = 1
-			}
-			for _, jobs := range queryJobs {
-				take := jobs
-				if len(take) > perQuery {
-					take = take[:perQuery]
+	if maxJobs == 0 {
+		for _, q := range queryOrder {
+			unique = append(unique, queryJobs[q]...)
+		}
+	} else {
+		offsets := make(map[string]int)
+		for len(unique) < maxJobs {
+			madeProgress := false
+			for _, q := range queryOrder {
+				if len(unique) >= maxJobs {
+					break
 				}
-				unique = append(unique, take...)
+				off := offsets[q]
+				if off < len(queryJobs[q]) {
+					unique = append(unique, queryJobs[q][off])
+					offsets[q]++
+					madeProgress = true
+				}
 			}
-			if len(unique) > maxJobs {
-				unique = unique[:maxJobs]
-			}
-		} else {
-			// No limit — use all unique jobs
-			for _, jobs := range queryJobs {
-				unique = append(unique, jobs...)
+			if !madeProgress {
+				break
 			}
 		}
 	}
 
+	slog.Info("refresh.dedup", "raw_total", rawTotal, "unique_after_dedup", len(unique), "errors", len(scrapeErrors))
 	send(sseEvent{Type: "dedup", Unique: len(unique), Total: rawTotal})
 
 	// --- Phase 2: score concurrently ---
-	// Concurrency matches OLLAMA_NUM_PARALLEL (default 1, set higher to use GPU/CPU cores)
+	// Build keyword list once from the candidate profile for fast pre-filtering.
+	// Jobs with zero tech overlap skip Ollama entirely and are scored instantly.
+	candidateKeywords := matcher.ExtractKeywords(profile)
+
 	ollamaParallel := 4
 	if op := os.Getenv("OLLAMA_NUM_PARALLEL"); op != "" {
 		if n, err := strconv.Atoi(op); err == nil && n > 0 {
@@ -283,11 +310,19 @@ func (h *Handler) RefreshJobsStream(w http.ResponseWriter, r *http.Request) {
 				<-sem
 				wg.Done()
 			}()
-			score, reason, err := h.matcher.Score(ctx, j, profile)
-			if err == nil {
-				j.MatchScore = score
-				j.MatchReason = reason
+
+			if !matcher.HasTechOverlap(j, candidateKeywords) {
+				// No technology overlap — skip Ollama, auto-score low instantly
+				j.MatchScore = 15
+				j.MatchReason = "Auto-filtered: none of the candidate's technologies were detected in this job description."
+			} else {
+				score, reason, err := h.matcher.Score(ctx, j, profile)
+				if err == nil {
+					j.MatchScore = score
+					j.MatchReason = reason
+				}
 			}
+
 			_ = h.store.Upsert(j)
 			n := int(scored.Add(1))
 			send(sseEvent{Type: "scoring", Current: n, Total: total, Title: j.Title, Company: j.Company, Score: j.MatchScore})
@@ -295,6 +330,7 @@ func (h *Handler) RefreshJobsStream(w http.ResponseWriter, r *http.Request) {
 	}
 	wg.Wait()
 
+	slog.Info("refresh.done", "scored", total, "errors", scrapeErrors)
 	send(sseEvent{Type: "done", Fetched: total, Errors: scrapeErrors})
 }
 

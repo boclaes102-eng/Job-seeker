@@ -15,6 +15,10 @@ export async function fetchPipeline(): Promise<Job[]> {
   return fetchJobs(undefined, 'pipeline')
 }
 
+export async function fetchIgnored(): Promise<Job[]> {
+  return fetchJobs(undefined, 'dismissed')
+}
+
 
 export async function updateStatus(id: string, status: JobStatus): Promise<void> {
   const res = await fetch(`${BASE}/jobs/${id}/status`, {

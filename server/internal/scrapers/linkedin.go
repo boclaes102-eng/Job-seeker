@@ -1,9 +1,12 @@
 package scrapers
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -13,10 +16,15 @@ import (
 	"job-seeker/server/internal/models"
 )
 
-// Belgian city LinkedIn geoIds
+const belgiumGeoID = "101165590"
+
+// City-level geoIds produce geographically scoped results on LinkedIn's public search.
+// The country-level geoId (101165590) returns globally popular results for
+// unauthenticated requests, so we prefer the city/region-level ID when available.
 var belgianCityGeoIDs = map[string]string{
+	"leuven":    "90009706",
 	"aarschot":  "90009706",
-	"leuven":    "90009706", // Leuven/Flemish Brabant area
+	"mechelen":  "90009900",
 	"brussel":   "103023037",
 	"brussels":  "103023037",
 	"antwerp":   "90010001",
@@ -24,14 +32,61 @@ var belgianCityGeoIDs = map[string]string{
 	"gent":      "90009999",
 	"ghent":     "90009999",
 	"hasselt":   "90009783",
-	"mechelen":  "90009900",
 	"brugge":    "90009764",
 	"bruges":    "90009764",
 	"liège":     "90010118",
 	"namur":     "90010190",
 }
 
-const belgiumGeoID = "101165590"
+// Belgian location indicators — country names in EN/FR/NL, regions, and major cities.
+// A whitelist is more robust than a blocklist: keep the job only if the location
+// matches one of these, or if the location is empty/remote (could still be Belgian).
+var belgianIndicators = []string{
+	// Country
+	"belgium", "belgique", "belgië",
+	// Regions
+	"vlaanderen", "flanders", "wallonie", "wallonia", "flemish", "walloon",
+	// Cities
+	"brussel", "brussels", "bruxelles",
+	"antwerp", "antwerpen",
+	"gent", "ghent",
+	"brugge", "bruges",
+	"leuven", "louvain",
+	"mechelen",
+	"hasselt",
+	"liège", "liege",
+	"namur",
+	"charleroi",
+	"mons",
+	"kortrijk",
+	"aalst",
+	"genk",
+	"roeselare",
+	"turnhout",
+	"sint-niklaas",
+	"dendermonde",
+	"ieper",
+	"tongeren",
+	"arlon",
+	"verviers",
+	"oostende", "ostend",
+}
+
+func isBelgian(location string) bool {
+	if location == "" {
+		return true // no location data — don't discard
+	}
+	loc := strings.ToLower(location)
+	if strings.Contains(loc, "remote") {
+		return true // remote roles can target Belgian workers
+	}
+	for _, indicator := range belgianIndicators {
+		if strings.Contains(loc, indicator) {
+			return true
+		}
+	}
+	return false
+}
 
 type LinkedInScraper struct {
 	Query      string
@@ -53,8 +108,10 @@ func NewLinkedIn(query, _ string, city string, radiusKm, maxDaysOld int) *Linked
 func (s *LinkedInScraper) Fetch() ([]*models.Job, error) {
 	params := url.Values{}
 	params.Set("keywords", s.Query)
+	// No geoId — LinkedIn's own public search form doesn't include one.
+	// It resolves "Belgium" to the correct geoId internally. Passing a geoId
+	// explicitly (90009706=Netherlands area, 101165590=UK-biased global) broke things.
 	params.Set("location", "Belgium")
-	params.Set("geoId", s.GeoID)
 	// f_TPR = time range in seconds; fall back to 30 days if no filter set
 	tpr := "r2592000"
 	switch s.MaxDaysOld {
@@ -69,13 +126,9 @@ func (s *LinkedInScraper) Fetch() ([]*models.Job, error) {
 	}
 	params.Set("f_TPR", tpr)
 	params.Set("sortBy", "DD")
-	if s.Radius > 0 {
-		// LinkedIn distance is in miles; 1 km ≈ 0.621 miles
-		miles := int(float64(s.Radius) * 0.621)
-		params.Set("distance", fmt.Sprintf("%d", miles))
-	}
 
 	rawURL := "https://www.linkedin.com/jobs/search/?" + params.Encode()
+	slog.Debug("linkedin.request", "query", s.Query, "url", rawURL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -90,11 +143,18 @@ func (s *LinkedInScraper) Fetch() ([]*models.Job, error) {
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
+		slog.Error("linkedin.http_error", "query", s.Query, "err", err)
 		return nil, fmt.Errorf("linkedin fetch: %w", err)
 	}
 	defer resp.Body.Close()
+	slog.Debug("linkedin.response", "query", s.Query, "status", resp.StatusCode)
 
-	doc, err := goquery.NewDocumentFromReader(resp.Body)
+	// Capture first 400 bytes so we can log an HTML preview when no jobs are found
+	// (helps detect login walls, CAPTCHAs, or empty pages).
+	preview, _ := io.ReadAll(io.LimitReader(resp.Body, 400))
+	fullBody := io.MultiReader(bytes.NewReader(preview), resp.Body)
+
+	doc, err := goquery.NewDocumentFromReader(fullBody)
 	if err != nil {
 		return nil, fmt.Errorf("linkedin parse: %w", err)
 	}
@@ -130,5 +190,23 @@ func (s *LinkedInScraper) Fetch() ([]*models.Job, error) {
 		})
 		return true
 	})
-	return jobs, nil
+
+	if len(jobs) == 0 {
+		slog.Warn("linkedin.no_jobs_scraped", "query", s.Query, "html_preview", string(preview))
+	} else {
+		slog.Debug("linkedin.raw_jobs", "query", s.Query, "count", len(jobs))
+	}
+
+	// Keep only Belgian jobs; log the filter decision for every job
+	var filtered []*models.Job
+	for _, j := range jobs {
+		passed := isBelgian(j.Location)
+		slog.Debug("linkedin.job", "query", s.Query, "title", j.Title, "company", j.Company, "location", j.Location, "belgian", passed)
+		if passed {
+			filtered = append(filtered, j)
+		}
+	}
+	slog.Debug("linkedin.filter_result", "query", s.Query, "raw", len(jobs), "passed", len(filtered))
+
+	return filtered, nil
 }

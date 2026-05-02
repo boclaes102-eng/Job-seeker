@@ -5,6 +5,7 @@ import (
 	"crypto/md5"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"time"
@@ -74,6 +75,7 @@ func (s *AdzunaScraper) Fetch() ([]*models.Job, error) {
 	}
 
 	apiURL := "https://api.adzuna.com/v1/api/jobs/be/search/1?" + params.Encode()
+	slog.Debug("adzuna.request", "query", s.Query, "city", s.City, "radius_km", s.Radius, "url", apiURL)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
 	if err != nil {
@@ -83,11 +85,14 @@ func (s *AdzunaScraper) Fetch() ([]*models.Job, error) {
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
+		slog.Error("adzuna.http_error", "query", s.Query, "err", err)
 		return nil, fmt.Errorf("adzuna fetch: %w", err)
 	}
 	defer resp.Body.Close()
+	slog.Debug("adzuna.response", "query", s.Query, "status", resp.StatusCode)
 
 	if resp.StatusCode != http.StatusOK {
+		slog.Error("adzuna.bad_status", "query", s.Query, "status", resp.Status)
 		return nil, fmt.Errorf("adzuna fetch: %s", resp.Status)
 	}
 
@@ -95,6 +100,7 @@ func (s *AdzunaScraper) Fetch() ([]*models.Job, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, fmt.Errorf("adzuna decode: %w", err)
 	}
+	slog.Debug("adzuna.result", "query", s.Query, "count", len(result.Results))
 
 	var jobs []*models.Job
 	for _, item := range result.Results {

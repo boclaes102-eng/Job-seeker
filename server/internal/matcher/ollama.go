@@ -57,7 +57,7 @@ type EmailDraft struct {
 
 // DraftEmail generates a professional job application email in the language of the job description.
 func (m *Matcher) DraftEmail(ctx context.Context, job *models.Job, profile string) (EmailDraft, error) {
-	summary := buildCandidateSummary(profile)
+	candidateProfile := stripSearchSection(profile)
 
 	prompt := fmt.Sprintf(`You are writing a professional job application email on behalf of the candidate below.
 
@@ -67,6 +67,7 @@ Rules:
 - Be specific — reference the job title and company name, and 1–2 concrete things from the candidate's background that match
 - Do NOT use generic filler phrases like "I am very motivated" or "I look forward to hearing from you" without substance
 - Do NOT include placeholder text like [Your Name] — use the candidate's actual name: Bo Claes
+- Somewhere naturally in the email (not forced), mention that this job was discovered through a personal job scouting system Bo built himself — a Go backend that scrapes job boards concurrently, scores postings with a local LLM, and surfaces the best matches. Keep it brief and confident, not boastful.
 - Sign off with: Bo Claes | boclaes102@gmail.com | github.com/boclaes102-eng
 
 Job title: %s
@@ -74,14 +75,14 @@ Company: %s
 Job description:
 %s
 
-Candidate summary:
+Candidate profile:
 %s
 
 Return ONLY valid JSON with exactly two fields:
 {"subject": "short professional subject line", "body": "full email body as plain text with newlines as \\n"}`,
 		job.Title, job.Company,
-		truncate(job.Description, 1500),
-		summary)
+		truncate(job.Description, 2000),
+		candidateProfile)
 
 	body, _ := json.Marshal(ollamaRequest{
 		Model:    m.model,
@@ -119,13 +120,14 @@ func (m *Matcher) Score(ctx context.Context, job *models.Job, profile string) (i
 		profile = "(no profile provided)"
 	}
 
-	summary := buildCandidateSummary(profile)
+	candidateProfile := stripSearchSection(profile)
 
 	prompt := fmt.Sprintf(`You are a precise job-fit evaluator. The job description may be in Dutch or English — evaluate it accurately either way.
 
-Step 1: Read the job and identify the PRIMARY required technologies/domain.
-Step 2: Check the candidate summary for each requirement.
-Step 3: Score honestly.
+Step 1: Read the "## Tech stack" section of the Candidate profile and list every technology name you see.
+Step 2: Read the job description and identify the PRIMARY required technologies/domain.
+Step 3: For each primary requirement, check if that exact name appears in the Tech stack list from Step 1, or in a project Stack line under "## Projects".
+Step 4: Score based only on what you found in Step 3.
 
 SCORING:
 - 85-100: candidate has ALL or nearly all primary required technologies
@@ -135,24 +137,24 @@ SCORING:
 - 0-29: wrong domain or stack entirely
 
 STRICT RULES:
+- If a technology appears verbatim in the candidate's Tech stack or Projects, they HAVE it — do not claim otherwise
+- Angular ≠ React, .NET ≠ Node.js — treat as gaps, but Fastify = Fastify, PostgreSQL = PostgreSQL
 - Score based on PRIMARY tech the JOB requires, not the candidate's general impressiveness
-- Angular ≠ React, .NET ≠ Node.js — treat as gaps
 - Only mention security/IoT/hardware experience if the JOB explicitly requires it
-- Do not mention unrelated projects to justify a high score
 
 Job title: %s
 Company: %s
 Job description:
 %s
 
-Candidate summary:
+Candidate profile:
 %s
 
 Return ONLY valid JSON:
 {"score": integer, "reason": "2-3 sentences naming the primary required technologies and whether the candidate has them. Be specific and factual."}`,
 		job.Title, job.Company,
-		truncate(job.Description, 2000),
-		summary)
+		truncate(job.Description, 3000),
+		candidateProfile)
 
 	body, _ := json.Marshal(ollamaRequest{
 		Model:    m.model,
@@ -185,74 +187,13 @@ Return ONLY valid JSON:
 	return result.Score, result.Reason, nil
 }
 
-// buildCandidateSummary produces a compact but complete candidate summary from profile.md.
-// Each section is condensed to its first meaningful line so the model gets full context
-// without anchoring on any single domain (e.g. cybersecurity narrative).
-func buildCandidateSummary(profile string) string {
-	sections := map[string]string{
-		"About me":             "",
-		"Experience":           "",
-		"Education":            "",
-		"Projects":             "",
-		"Tech stack":           "",
-		"What I'm looking for": "",
+// stripSearchSection removes the ## Search section from profile.md before sending
+// to the model — it contains scraping config, not career information.
+func stripSearchSection(profile string) string {
+	if idx := strings.Index(profile, "\n## Search"); idx != -1 {
+		return strings.TrimSpace(profile[:idx])
 	}
-	order := []string{"Tech stack", "What I'm looking for", "Experience", "Projects", "Education", "About me"}
-
-	// Extract each section
-	for heading := range sections {
-		sections[heading] = condensedSection(extractSection(profile, heading))
-	}
-
-	var sb strings.Builder
-	for _, key := range order {
-		if v := sections[key]; v != "" {
-			sb.WriteString("## " + key + "\n" + v + "\n\n")
-		}
-	}
-	return strings.TrimSpace(sb.String())
-}
-
-// condensedSection keeps only lines that carry factual content (not blank, not pure narrative).
-// Caps at ~400 chars so each section stays short.
-func condensedSection(s string) string {
-	var lines []string
-	total := 0
-	for _, line := range strings.Split(strings.TrimSpace(s), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "<!--") {
-			continue
-		}
-		// Skip pure narrative sentences (long prose without tech keywords)
-		lines = append(lines, line)
-		total += len(line)
-		if total > 400 {
-			break
-		}
-	}
-	return strings.Join(lines, "\n")
-}
-
-// extractSection pulls the content under a ## Heading from markdown.
-func extractSection(md, heading string) string {
-	lines := strings.Split(md, "\n")
-	var result []string
-	inSection := false
-	for _, line := range lines {
-		if strings.HasPrefix(line, "## ") {
-			if inSection {
-				break
-			}
-			if strings.EqualFold(strings.TrimPrefix(line, "## "), heading) {
-				inSection = true
-			}
-			continue
-		}
-		if inSection {
-			result = append(result, line)
-		}
-	}
-	return strings.Join(result, "\n")
+	return profile
 }
 
 func truncate(s string, max int) string {

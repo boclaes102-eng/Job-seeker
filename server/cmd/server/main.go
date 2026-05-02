@@ -8,6 +8,7 @@ import (
 
 	"github.com/joho/godotenv"
 	"job-seeker/server/internal/api"
+	"job-seeker/server/internal/debuglog"
 	"job-seeker/server/internal/matcher"
 	"job-seeker/server/internal/store"
 )
@@ -17,6 +18,13 @@ func main() {
 	if err := godotenv.Load("../.env"); err != nil {
 		_ = godotenv.Load("../../.env")
 	}
+
+	// Log to both stdout and debug.log at the project root
+	logPath := os.Getenv("LOG_PATH")
+	if logPath == "" {
+		logPath = "../debug.log"
+	}
+	debuglog.Init(logPath)
 
 	dbPath := os.Getenv("DB_PATH")
 	if dbPath == "" {
