@@ -184,8 +184,17 @@ func (h *Handler) RefreshJobsStream(w http.ResponseWriter, r *http.Request) {
 	if wantSources["linkedin"] {
 		go func() {
 			for i, q := range cfg.Queries {
+				if ctx.Err() != nil {
+					ch <- scrapeResult{source: "linkedin", query: q, err: ctx.Err()}
+					continue
+				}
 				if i > 0 {
-					time.Sleep(500 * time.Millisecond)
+					select {
+					case <-ctx.Done():
+						ch <- scrapeResult{source: "linkedin", query: q, err: ctx.Err()}
+						continue
+					case <-time.After(500 * time.Millisecond):
+					}
 				}
 				jobs, err := scrapers.NewLinkedIn(q, cfg.Location, cfg.City, radius, maxDaysOld).Fetch()
 				ch <- scrapeResult{"linkedin", q, jobs, err}
@@ -199,8 +208,17 @@ func (h *Handler) RefreshJobsStream(w http.ResponseWriter, r *http.Request) {
 			appID := os.Getenv("ADZUNA_APP_ID")
 			appKey := os.Getenv("ADZUNA_APP_KEY")
 			for i, q := range cfg.Queries {
+				if ctx.Err() != nil {
+					ch <- scrapeResult{source: "adzuna", query: q, err: ctx.Err()}
+					continue
+				}
 				if i > 0 {
-					time.Sleep(700 * time.Millisecond)
+					select {
+					case <-ctx.Done():
+						ch <- scrapeResult{source: "adzuna", query: q, err: ctx.Err()}
+						continue
+					case <-time.After(700 * time.Millisecond):
+					}
 				}
 				jobs, err := scrapers.NewAdzuna(q, appID, appKey, cfg.City, radius, maxDaysOld).Fetch()
 				ch <- scrapeResult{"adzuna", q, jobs, err}
@@ -208,8 +226,7 @@ func (h *Handler) RefreshJobsStream(w http.ResponseWriter, r *http.Request) {
 		}()
 	}
 
-	// Collect results and track which query produced each job
-	urlToQuery := map[string]string{}
+	// Collect results, deduping by URL across queries.
 	queryJobs := map[string][]*models.Job{} // query → jobs (deduped per query)
 	seenURL := map[string]bool{}
 	scrapeErrors := map[string]string{}
@@ -226,7 +243,6 @@ func (h *Handler) RefreshJobsStream(w http.ResponseWriter, r *http.Request) {
 			for _, j := range res.jobs {
 				if !seenURL[j.URL] {
 					seenURL[j.URL] = true
-					urlToQuery[j.URL] = res.query
 					queryJobs[res.query] = append(queryJobs[res.query], j)
 				}
 			}
@@ -281,10 +297,16 @@ func (h *Handler) RefreshJobsStream(w http.ResponseWriter, r *http.Request) {
 	slog.Info("refresh.dedup", "raw_total", rawTotal, "unique_after_dedup", len(unique), "errors", len(scrapeErrors))
 	send(sseEvent{Type: "dedup", Unique: len(unique), Total: rawTotal})
 
-	// --- Phase 2: score concurrently ---
-	// Build keyword list once from the candidate profile for fast pre-filtering.
-	// Jobs with zero tech overlap skip Ollama entirely and are scored instantly.
-	candidateKeywords := matcher.ExtractKeywords(profile)
+	// --- Phase 2: score with the two-stage pipeline ---
+	// Stage 1 (deterministic) runs synchronously on every job in microseconds.
+	// Stage 2 (LLM referee) runs concurrently only on jobs in the uncertainty
+	// band, and is skipped via cache for previously-seen (job, profile) pairs.
+	candidateIdx := matcher.BuildCandidateIndex(profile)
+	slog.Info("refresh.candidate_index",
+		"techs", len(candidateIdx.TechTokens),
+		"roles", len(candidateIdx.RoleKeywords),
+		"profile_hash", candidateIdx.Hash,
+		"model", h.matcher.Model())
 
 	ollamaParallel := 4
 	if op := os.Getenv("OLLAMA_NUM_PARALLEL"); op != "" {
@@ -294,13 +316,15 @@ func (h *Handler) RefreshJobsStream(w http.ResponseWriter, r *http.Request) {
 	}
 	total := len(unique)
 	var scored atomic.Int32
+	var llmCalls atomic.Int32
 	sem := make(chan struct{}, ollamaParallel)
 	var wg sync.WaitGroup
 
+scoreLoop:
 	for _, job := range unique {
 		select {
 		case <-ctx.Done():
-			break
+			break scoreLoop
 		default:
 		}
 		sem <- struct{}{}
@@ -311,16 +335,14 @@ func (h *Handler) RefreshJobsStream(w http.ResponseWriter, r *http.Request) {
 				wg.Done()
 			}()
 
-			if !matcher.HasTechOverlap(j, candidateKeywords) {
-				// No technology overlap — skip Ollama, auto-score low instantly
-				j.MatchScore = 15
-				j.MatchReason = "Auto-filtered: none of the candidate's technologies were detected in this job description."
-			} else {
-				score, reason, err := h.matcher.Score(ctx, j, profile)
-				if err == nil {
-					j.MatchScore = score
-					j.MatchReason = reason
-				}
+			score, reason, usedLLM, err := h.matcher.ScoreJob(ctx, j, candidateIdx)
+			if err != nil {
+				slog.Warn("scoring.error", "url", j.URL, "err", err)
+			}
+			j.MatchScore = score
+			j.MatchReason = reason
+			if usedLLM {
+				llmCalls.Add(1)
 			}
 
 			_ = h.store.Upsert(j)
@@ -330,7 +352,11 @@ func (h *Handler) RefreshJobsStream(w http.ResponseWriter, r *http.Request) {
 	}
 	wg.Wait()
 
-	slog.Info("refresh.done", "scored", total, "errors", scrapeErrors)
+	slog.Info("refresh.done",
+		"scored", total,
+		"llm_calls", llmCalls.Load(),
+		"deterministic_only", int32(total)-llmCalls.Load(),
+		"errors", scrapeErrors)
 	send(sseEvent{Type: "done", Fetched: total, Errors: scrapeErrors})
 }
 
@@ -381,7 +407,9 @@ func (h *Handler) AnalyzeJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	profile := h.readProfile()
-	score, reason, err := h.matcher.Score(r.Context(), job, profile)
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+	score, reason, err := h.matcher.Score(ctx, job, profile)
 	if err != nil {
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -400,7 +428,9 @@ func (h *Handler) DraftEmail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	profile := h.readProfile()
-	draft, err := h.matcher.DraftEmail(r.Context(), job, profile)
+	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
+	defer cancel()
+	draft, err := h.matcher.DraftEmail(ctx, job, profile)
 	if err != nil {
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return

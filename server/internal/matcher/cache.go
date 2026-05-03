@@ -1,0 +1,59 @@
+package matcher
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"sync"
+)
+
+// scoreCache is a process-local in-memory cache. We don't persist it because
+// scores depend on the current profile.md, which the user can change at any
+// time, and SQLite already stores the most recent score per job.
+//
+// The cache key incorporates the profile hash, so editing profile.md
+// automatically invalidates everything.
+type scoreCache struct {
+	mu      sync.RWMutex
+	entries map[string]cachedScore
+}
+
+type cachedScore struct {
+	Score  int
+	Reason string
+}
+
+func newScoreCache() *scoreCache {
+	return &scoreCache{entries: map[string]cachedScore{}}
+}
+
+func (c *scoreCache) key(jobURL, jobDesc, profileHash string) string {
+	h := sha256.New()
+	h.Write([]byte(jobURL))
+	h.Write([]byte{0})
+	h.Write([]byte(jobDesc))
+	h.Write([]byte{0})
+	h.Write([]byte(profileHash))
+	sum := h.Sum(nil)
+	return hex.EncodeToString(sum[:12])
+}
+
+func (c *scoreCache) get(key string) (cachedScore, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	e, ok := c.entries[key]
+	return e, ok
+}
+
+func (c *scoreCache) put(key string, score int, reason string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries[key] = cachedScore{Score: score, Reason: reason}
+}
+
+// Reset clears the cache. Useful when the candidate updates their profile
+// or wants to force re-scoring.
+func (c *scoreCache) reset() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries = map[string]cachedScore{}
+}

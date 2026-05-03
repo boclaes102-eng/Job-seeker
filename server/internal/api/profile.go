@@ -6,8 +6,8 @@ import (
 )
 
 type SearchConfig struct {
-	Location string // country/region passed to Indeed and LinkedIn text param
-	City     string // city passed to VDAB for radius search (e.g. "Aarschot")
+	Location string // country/region (e.g. "België"), passed to LinkedIn's location field
+	City     string // city for radius search via Adzuna (e.g. "Leuven")
 	Queries  []string
 }
 

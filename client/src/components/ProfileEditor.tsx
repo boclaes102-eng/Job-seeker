@@ -114,7 +114,7 @@ function SearchCard({ cfg, onChange }: SearchCardProps) {
     <div className="bg-white border border-gray-200 rounded-xl p-5 shadow-sm flex flex-col gap-4">
       <div>
         <h3 className="text-sm font-semibold text-gray-800">Search</h3>
-        <p className="text-xs text-gray-400 mt-0.5">Controls what gets scraped from LinkedIn, VDAB and Indeed.</p>
+        <p className="text-xs text-gray-400 mt-0.5">Controls what gets scraped from LinkedIn and Adzuna.</p>
       </div>
 
       <div className="flex gap-4 flex-wrap">
@@ -127,7 +127,7 @@ function SearchCard({ cfg, onChange }: SearchCardProps) {
           />
         </div>
         <div className="flex flex-col gap-1">
-          <label className="text-xs font-medium text-gray-500">City (VDAB radius)</label>
+          <label className="text-xs font-medium text-gray-500">City (used for radius search)</label>
           <input
             value={cfg.city}
             onChange={e => onChange({ ...cfg, city: e.target.value })}

@@ -7,7 +7,7 @@ export interface Job {
   location: string
   description: string
   url: string
-  source: 'indeed' | 'vdab' | 'linkedin'
+  source: 'linkedin' | 'adzuna'
   postedAt: string
   fetchedAt: string
   matchScore: number

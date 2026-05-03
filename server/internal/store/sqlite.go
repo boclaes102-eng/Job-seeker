@@ -153,7 +153,8 @@ func (s *Store) Close() error {
 }
 
 // parseTime handles the various datetime formats SQLite may return.
-// Falls back to time.Now() so jobs are never hidden by a failed parse.
+// Returns the zero time on failure rather than time.Now(), so callers
+// can detect parse problems instead of silently treating bad rows as fresh.
 func parseTime(s string) time.Time {
 	for _, l := range []string{
 		time.RFC3339Nano,
@@ -168,5 +169,5 @@ func parseTime(s string) time.Time {
 			return t
 		}
 	}
-	return time.Now()
+	return time.Time{}
 }
