@@ -296,12 +296,6 @@ func (h *Handler) RefreshJobsStream(w http.ResponseWriter, r *http.Request) {
 		"profile_hash", candidateIdx.Hash,
 		"model", h.matcher.Model())
 
-	hydrateConcurrency := 4
-	if v := os.Getenv("HYDRATE_CONCURRENCY"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			hydrateConcurrency = n
-		}
-	}
 	scoreConcurrency := 4
 	if v := os.Getenv("OLLAMA_NUM_PARALLEL"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -309,17 +303,13 @@ func (h *Handler) RefreshJobsStream(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// scoreCh feeds scoring workers. Buffered so hydration workers don't
-	// block when scoring is the slower stage (typical when LLM is involved).
+	// scoreCh feeds scoring workers.
 	scoreCh := make(chan *models.Job, len(unique))
 
-	// 1. Hydration pool. Reads jobs from `unique`, fetches LinkedIn descriptions
-	//    when needed (Adzuna jobs already have descriptions), pushes to scoreCh.
-	hydrateSem := make(chan struct{}, hydrateConcurrency)
-	var hydrateWG sync.WaitGroup
-	var hydrated atomic.Int32
-
-	// Count how many we'll actually hydrate so the UI can show meaningful progress.
+	// 1. Hydration: fetch LinkedIn descriptions sequentially with a delay between
+	// each request. Concurrent bursts are what trigger LinkedIn's rate limiter —
+	// sequential + delay keeps us well under the threshold.
+	// A circuit breaker stops hydration early if a 429 is detected.
 	var toHydrate int
 	for _, j := range unique {
 		if j.Source == "linkedin" && j.Description == "" {
@@ -330,39 +320,49 @@ func (h *Handler) RefreshJobsStream(w http.ResponseWriter, r *http.Request) {
 		send(sseEvent{Type: "hydrate_start", Total: toHydrate})
 	}
 
-	for _, job := range unique {
-		j := job
-		if j.Source != "linkedin" || j.Description != "" {
-			// Already has a description — push straight to scoring.
-			scoreCh <- j
-			continue
-		}
-		hydrateWG.Add(1)
-		hydrateSem <- struct{}{}
-		go func() {
-			defer func() {
-				<-hydrateSem
-				hydrateWG.Done()
-			}()
+	go func() {
+		var hydrated atomic.Int32
+		blocked := false
+		first := true
+		for _, job := range unique {
+			j := job
+			if j.Source != "linkedin" || j.Description != "" {
+				scoreCh <- j
+				continue
+			}
+			if blocked {
+				// Rate-limited — skip description fetch, score on title only
+				slog.Debug("linkedin.hydration_skipped", "url", j.URL, "reason", "circuit breaker open")
+				scoreCh <- j
+				n := int(hydrated.Add(1))
+				send(sseEvent{Type: "hydrate_progress", Current: n, Total: toHydrate})
+				continue
+			}
+			// Space requests: 2 seconds apart (skip delay for the very first one)
+			if !first {
+				select {
+				case <-ctx.Done():
+					blocked = true
+				case <-time.After(2 * time.Second):
+				}
+			}
+			first = false
 			dctx, dcancel := context.WithTimeout(ctx, 12*time.Second)
-			defer dcancel()
 			desc, err := scrapers.FetchLinkedInDescription(dctx, j.URL)
+			dcancel()
 			if err == nil && desc != "" {
 				j.Description = desc
 			} else if err != nil {
 				slog.Debug("linkedin.detail_failed", "url", j.URL, "err", err)
+				if strings.Contains(err.Error(), "429") {
+					blocked = true
+					slog.Warn("linkedin.hydration_blocked", "msg", "429 on detail page — skipping remaining descriptions")
+				}
 			}
 			n := int(hydrated.Add(1))
 			send(sseEvent{Type: "hydrate_progress", Current: n, Total: toHydrate})
-			// Whether or not we got a description, push the job — the matcher
-			// will gracefully score with whatever we have.
 			scoreCh <- j
-		}()
-	}
-
-	// Close scoreCh once all hydration is done so scoring workers know to stop.
-	go func() {
-		hydrateWG.Wait()
+		}
 		close(scoreCh)
 	}()
 
