@@ -10,12 +10,14 @@ import { IgnoredView } from './components/IgnoredView'
 import { RefreshProgress } from './components/RefreshProgress'
 
 type Tab = 'jobs' | 'pipeline' | 'profile' | 'ignored'
-type RefreshPhase = 'scraping' | 'scoring' | 'done'
+type RefreshPhase = 'scraping' | 'hydrating' | 'scoring' | 'done'
 
 interface Progress {
   phase: RefreshPhase
   scraped: number
   totalScrapes: number
+  hydrated: number
+  totalToHydrate: number
   scored: number
   totalToScore: number
   currentJob: string
@@ -45,7 +47,7 @@ export default function App() {
 
   async function handleRefresh() {
     if (esRef.current) esRef.current.close()
-    setProgress({ phase: 'scraping', scraped: 0, totalScrapes: 0, scored: 0, totalToScore: 0, currentJob: '', log: [], errors: [] })
+    setProgress({ phase: 'scraping', scraped: 0, totalScrapes: 0, hydrated: 0, totalToHydrate: 0, scored: 0, totalToScore: 0, currentJob: '', log: [], errors: [] })
 
     const params = new URLSearchParams({ sources: selectedSources.join(','), radius: String(radius), dateRange, maxJobs: String(maxJobs) })
     const es = new EventSource(`/api/jobs/refresh/stream?${params}`)
@@ -76,10 +78,15 @@ export default function App() {
             return { ...prev, scraped: prev.scraped + 1, errors: [...prev.errors, `${ev.source}/${ev.query}: ${ev.error}`], log }
           case 'dedup':
             log.push(`Dedup: ${ev.total ?? 0} raw → ${ev.unique ?? 0} unique`)
-            return { ...prev, phase: 'scoring', totalToScore: ev.unique, log }
+            return { ...prev, totalToScore: ev.unique, log }
+          case 'hydrate_start':
+            log.push(`Fetching ${ev.total ?? 0} LinkedIn descriptions…`)
+            return { ...prev, phase: 'hydrating', totalToHydrate: ev.total, log }
+          case 'hydrate_progress':
+            return { ...prev, hydrated: ev.current }
           case 'scoring':
             log.push(`[${ev.current}/${ev.total}] ${ev.company} — ${ev.title} (${ev.score})`)
-            return { ...prev, scored: ev.current, currentJob: `${ev.company} — ${ev.title}` }
+            return { ...prev, phase: 'scoring', scored: ev.current, currentJob: `${ev.company} — ${ev.title}` }
           default:
             return prev
         }
@@ -173,6 +180,8 @@ export default function App() {
                 phase={progress.phase}
                 scraped={progress.scraped}
                 totalScrapes={progress.totalScrapes}
+                hydrated={progress.hydrated}
+                totalToHydrate={progress.totalToHydrate}
                 scored={progress.scored}
                 totalToScore={progress.totalToScore}
                 currentJob={progress.currentJob}

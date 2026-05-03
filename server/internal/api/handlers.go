@@ -121,7 +121,15 @@ func (h *Handler) RefreshJobsStream(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
 	defer cancel()
 
+	// send is called from multiple goroutines (scrapers, hydration workers,
+	// scoring workers). Without the mutex, concurrent writes to the SSE
+	// response can interleave bytes mid-event and break JSON parsing on
+	// the client. The mutex serialises writes; events are small so contention
+	// is negligible.
+	var sendMu sync.Mutex
 	send := func(ev sseEvent) {
+		sendMu.Lock()
+		defer sendMu.Unlock()
 		b, _ := json.Marshal(ev)
 		fmt.Fprintf(w, "data: %s\n\n", b)
 		flusher.Flush()
@@ -296,6 +304,58 @@ func (h *Handler) RefreshJobsStream(w http.ResponseWriter, r *http.Request) {
 
 	slog.Info("refresh.dedup", "raw_total", rawTotal, "unique_after_dedup", len(unique), "errors", len(scrapeErrors))
 	send(sseEvent{Type: "dedup", Unique: len(unique), Total: rawTotal})
+
+	// --- Phase 1.5: hydrate LinkedIn job descriptions ---
+	// LinkedIn's search-results page only carries titles + URLs, not descriptions.
+	// The matcher needs the full text to score accurately — without this step
+	// every LinkedIn job lands at score ~10-15 (no tech overlap detected).
+	// We fetch each detail page concurrently, with a bounded pool to avoid
+	// triggering LinkedIn's rate limiter.
+	var hydrateTotal int
+	for _, j := range unique {
+		if j.Source == "linkedin" && j.Description == "" {
+			hydrateTotal++
+		}
+	}
+	if hydrateTotal > 0 {
+		send(sseEvent{Type: "hydrate_start", Total: hydrateTotal})
+	}
+	hydrateConcurrency := 4
+	hydrateSem := make(chan struct{}, hydrateConcurrency)
+	var hydrateWG sync.WaitGroup
+	var hydrated atomic.Int32
+	var hydrateFailed atomic.Int32
+	var hydrateProgress atomic.Int32
+	for _, job := range unique {
+		if job.Source != "linkedin" || job.Description != "" {
+			continue
+		}
+		j := job
+		hydrateSem <- struct{}{}
+		hydrateWG.Add(1)
+		go func() {
+			defer func() {
+				<-hydrateSem
+				hydrateWG.Done()
+			}()
+			dctx, dcancel := context.WithTimeout(ctx, 10*time.Second)
+			defer dcancel()
+			desc, err := scrapers.FetchLinkedInDescription(dctx, j.URL)
+			if err != nil || desc == "" {
+				hydrateFailed.Add(1)
+				if err != nil {
+					slog.Debug("linkedin.detail_failed", "url", j.URL, "err", err)
+				}
+			} else {
+				j.Description = desc
+				hydrated.Add(1)
+			}
+			n := int(hydrateProgress.Add(1))
+			send(sseEvent{Type: "hydrate_progress", Current: n, Total: hydrateTotal})
+		}()
+	}
+	hydrateWG.Wait()
+	slog.Info("refresh.hydrate", "fetched", hydrated.Load(), "failed", hydrateFailed.Load(), "total", len(unique))
 
 	// --- Phase 2: score with the two-stage pipeline ---
 	// Stage 1 (deterministic) runs synchronously on every job in microseconds.
