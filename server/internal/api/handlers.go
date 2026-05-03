@@ -208,9 +208,27 @@ func (h *Handler) RefreshJobsStream(w http.ResponseWriter, r *http.Request) {
 	ch := make(chan scrapeResult, totalScrapes)
 
 	if wantSources["linkedin"] {
+		// Build a list of real Belgian cities within the user's radius.
+		// Each job query gets the next city in the list (round-robin), so the 30
+		// queries are spread across the nearby cities instead of all hitting "Belgium".
+		// LinkedIn's city-name text search is far more reliable than geoId for
+		// unauthenticated requests.
+		nearbyCities := scrapers.CitiesWithinRadius(cfg.City, float64(radius))
+		locationStrings := make([]string, len(nearbyCities))
+		for i, c := range nearbyCities {
+			locationStrings[i] = c.Name + ", Belgium"
+		}
+		if len(locationStrings) == 0 {
+			locationStrings = []string{"Belgium"}
+		}
+		slog.Info("linkedin.locations", "center", cfg.City, "radius_km", radius, "cities", len(locationStrings))
+
+		i := 0
 		go scrapeQueriesSequentially(ctx, "linkedin", cfg.Queries, 500*time.Millisecond, ch,
 			func(q string) ([]*models.Job, error) {
-				return scrapers.NewLinkedIn(q, cfg.Location, cfg.City, radius, maxDaysOld).Fetch()
+				loc := locationStrings[i%len(locationStrings)]
+				i++
+				return scrapers.NewLinkedIn(q, loc, maxDaysOld).Fetch()
 			})
 	}
 	if wantSources["adzuna"] {

@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
 
@@ -31,32 +30,12 @@ import (
 // /jobs-guest/jobs/api/jobPosting/{id}. We try guest first there too.
 
 const (
-	belgiumGeoID         = "101165590"
 	guestSearchURL       = "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
 	guestJobPostingURL   = "https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/"
 	maxJobsPerQuery      = 12
 	httpRequestTimeout   = 15 * time.Second
 	detailRequestTimeout = 10 * time.Second
 )
-
-// City-level geoIds give geographically scoped results. Country-level is the
-// fallback when the requested city isn't recognised.
-var belgianCityGeoIDs = map[string]string{
-	"leuven":    "90009706",
-	"aarschot":  "90009706",
-	"mechelen":  "90009900",
-	"brussel":   "103023037",
-	"brussels":  "103023037",
-	"antwerp":   "90010001",
-	"antwerpen": "90010001",
-	"gent":      "90009999",
-	"ghent":     "90009999",
-	"hasselt":   "90009783",
-	"brugge":    "90009764",
-	"bruges":    "90009764",
-	"liège":     "90010118",
-	"namur":     "90010190",
-}
 
 // belgianIndicators is a whitelist used to filter scraped jobs to Belgium-only.
 // More robust than a blocklist: keep the job if location matches any indicator,
@@ -111,19 +90,17 @@ const linkedInUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit
 
 type LinkedInScraper struct {
 	Query      string
-	GeoID      string
-	Radius     int
+	Location   string // e.g. "Leuven, Belgium" — set by the caller from our own radius calc
 	MaxDaysOld int
 }
 
-func NewLinkedIn(query, _, city string, radiusKm, maxDaysOld int) *LinkedInScraper {
-	geoID := belgiumGeoID
-	if city != "" {
-		if id, ok := belgianCityGeoIDs[strings.ToLower(city)]; ok {
-			geoID = id
-		}
+// NewLinkedIn creates a scraper for one query + one specific location string.
+// The location comes from CitiesWithinRadius, not from LinkedIn's geoId system.
+func NewLinkedIn(query, location string, maxDaysOld int) *LinkedInScraper {
+	if location == "" {
+		location = "Belgium"
 	}
-	return &LinkedInScraper{Query: query, GeoID: geoID, Radius: radiusKm, MaxDaysOld: maxDaysOld}
+	return &LinkedInScraper{Query: query, Location: location, MaxDaysOld: maxDaysOld}
 }
 
 // Fetch returns up to maxJobsPerQuery LinkedIn job postings. It tries the
@@ -145,15 +122,11 @@ func (s *LinkedInScraper) Fetch() ([]*models.Job, error) {
 func (s *LinkedInScraper) fetchGuest(ctx context.Context) ([]*models.Job, error) {
 	params := url.Values{}
 	params.Set("keywords", s.Query)
-	params.Set("location", "Belgium")
-	params.Set("geoId", s.GeoID)
-	params.Set("sortBy", "DD") // descending date — newest first
+	params.Set("location", s.Location) // specific city, e.g. "Leuven, Belgium"
+	params.Set("sortBy", "DD")         // descending date — newest first
 
 	if tpr := timeFilter(s.MaxDaysOld); tpr != "" {
 		params.Set("f_TPR", tpr)
-	}
-	if s.Radius > 0 {
-		params.Set("distance", strconv.Itoa(s.Radius))
 	}
 	params.Set("start", "0")
 
@@ -170,7 +143,7 @@ func (s *LinkedInScraper) fetchGuest(ctx context.Context) ([]*models.Job, error)
 func (s *LinkedInScraper) fetchSearchPage(ctx context.Context) ([]*models.Job, error) {
 	params := url.Values{}
 	params.Set("keywords", s.Query)
-	params.Set("location", "Belgium")
+	params.Set("location", s.Location)
 	if tpr := timeFilter(s.MaxDaysOld); tpr != "" {
 		params.Set("f_TPR", tpr)
 	}
