@@ -12,5 +12,6 @@ export interface Job {
   fetchedAt: string
   matchScore: number
   matchReason: string
+  matchedTech: string[] | null
   status: JobStatus
 }

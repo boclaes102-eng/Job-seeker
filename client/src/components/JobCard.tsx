@@ -2,6 +2,7 @@ import { useState } from 'react'
 import type { Job, JobStatus } from '../types/job'
 import { SourceBadge } from './SourceBadge'
 import { ScoreRing } from './ScoreRing'
+import { TechBadges } from './TechBadges'
 
 interface Props {
   job: Job
@@ -10,14 +11,25 @@ interface Props {
   analyzing: boolean
 }
 
+// daysSince returns whole days between then and now (rounded down).
+function daysSince(date: Date): number {
+  const ms = Date.now() - date.getTime()
+  return Math.max(0, Math.floor(ms / 86_400_000))
+}
+
 export function JobCard({ job, onStatusChange, onAnalyze, analyzing }: Props) {
   const [expanded, setExpanded] = useState(false)
-  const posted = new Date(job.postedAt).toLocaleDateString('en-BE', { day: 'numeric', month: 'short' })
+  const postedDate = new Date(job.postedAt)
+  const posted = postedDate.toLocaleDateString('en-BE', { day: 'numeric', month: 'short' })
+  const days = daysSince(postedDate)
+  const isStale = days > 7
 
   return (
     <article
       onClick={() => setExpanded(e => !e)}
-      className="bg-white border border-gray-200 rounded-xl p-5 flex gap-4 shadow-sm hover:shadow-md transition-shadow cursor-pointer select-none"
+      className={`bg-white border rounded-xl p-5 flex gap-4 shadow-sm hover:shadow-md transition-shadow cursor-pointer select-none ${
+        isStale ? 'border-amber-200 bg-amber-50/30' : 'border-gray-200'
+      }`}
     >
       <ScoreRing score={job.matchScore} />
 
@@ -26,11 +38,19 @@ export function JobCard({ job, onStatusChange, onAnalyze, analyzing }: Props) {
           <div className="flex items-center gap-2 flex-wrap">
             <SourceBadge source={job.source} />
             <span className="text-xs text-gray-400">{posted}</span>
+            {isStale && (
+              <span
+                className="text-[10px] font-medium px-2 py-0.5 rounded-full bg-amber-100 text-amber-700"
+                title={`Posted ${days} days ago — likely already filled`}
+              >
+                {days}d old
+              </span>
+            )}
           </div>
           <span className="text-gray-300 text-xs shrink-0 mt-0.5">{expanded ? '▲' : '▼'}</span>
         </div>
 
-        {/* Title — click navigates, doesn't toggle card */}
+        {/* Title — clicking opens the job, doesn't toggle the card */}
         <a
           href={job.url}
           target="_blank"
@@ -40,9 +60,19 @@ export function JobCard({ job, onStatusChange, onAnalyze, analyzing }: Props) {
         >
           {job.title}
         </a>
-        <p className="text-sm text-gray-500 mt-0.5">{job.company}{job.location ? ` · ${job.location}` : ''}</p>
+        <p className="text-sm text-gray-500 mt-0.5">
+          {job.company}
+          {job.location ? ` · ${job.location}` : ''}
+        </p>
 
-        {/* AI reason — collapsed: 2 lines, expanded: full */}
+        {/* Matched-tech badges — at-a-glance reason for the score */}
+        {job.matchedTech && job.matchedTech.length > 0 && (
+          <div className="mt-2">
+            <TechBadges tech={job.matchedTech} maxShown={expanded ? 99 : 6} />
+          </div>
+        )}
+
+        {/* AI reason */}
         {job.matchReason && (
           <p className={`mt-2 text-sm text-gray-600 italic leading-snug ${expanded ? '' : 'line-clamp-2'}`}>
             {job.matchReason}
@@ -59,11 +89,8 @@ export function JobCard({ job, onStatusChange, onAnalyze, analyzing }: Props) {
           </div>
         )}
 
-        {/* Actions — clicks don't bubble up to card toggle */}
-        <div
-          className="mt-3 flex gap-2 flex-wrap"
-          onClick={e => e.stopPropagation()}
-        >
+        {/* Actions — clicks don't bubble up to the card toggle */}
+        <div className="mt-3 flex gap-2 flex-wrap" onClick={e => e.stopPropagation()}>
           <button
             onClick={() => onStatusChange(job.id, 'pipeline')}
             className="text-xs px-3 py-1 rounded-full font-medium bg-indigo-50 hover:bg-indigo-100 text-indigo-700 transition-colors"

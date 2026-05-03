@@ -3,6 +3,7 @@ import type { Job } from '../types/job'
 import { fetchIgnored, updateStatus } from '../api/client'
 import { SourceBadge } from './SourceBadge'
 import { ScoreRing } from './ScoreRing'
+import { TechBadges } from './TechBadges'
 
 interface Props {
   onRestore: () => void
@@ -55,6 +56,11 @@ export function IgnoredView({ onRestore }: Props) {
                 {job.title}
               </a>
               <p className="text-sm text-gray-500 mt-0.5">{job.company}{job.location ? ` · ${job.location}` : ''}</p>
+              {job.matchedTech && job.matchedTech.length > 0 && (
+                <div className="mt-2">
+                  <TechBadges tech={job.matchedTech} maxShown={5} />
+                </div>
+              )}
               {job.matchReason && (
                 <p className="mt-2 text-sm text-gray-600 italic leading-snug line-clamp-2">{job.matchReason}</p>
               )}

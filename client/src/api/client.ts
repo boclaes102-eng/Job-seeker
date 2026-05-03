@@ -29,7 +29,7 @@ export async function updateStatus(id: string, status: JobStatus): Promise<void>
   if (!res.ok) throw new Error('Status update failed')
 }
 
-export async function analyzeJob(id: string): Promise<{ score: number; reason: string }> {
+export async function analyzeJob(id: string): Promise<{ score: number; reason: string; matchedTech: string[] }> {
   const res = await fetch(`${BASE}/jobs/${id}/analyze`, { method: 'POST' })
   if (!res.ok) throw new Error('Analysis failed')
   return res.json()

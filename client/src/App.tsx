@@ -117,7 +117,9 @@ export default function App() {
     setAnalyzingId(id)
     try {
       const result = await analyzeJob(id)
-      setAllJobs(prev => prev.map(j => j.id === id ? { ...j, matchScore: result.score, matchReason: result.reason } : j))
+      setAllJobs(prev => prev.map(j => j.id === id
+        ? { ...j, matchScore: result.score, matchReason: result.reason, matchedTech: result.matchedTech }
+        : j))
     } finally {
       setAnalyzingId(null)
     }

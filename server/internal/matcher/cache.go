@@ -6,9 +6,9 @@ import (
 	"sync"
 )
 
-// scoreCache is a process-local in-memory cache. We don't persist it because
-// scores depend on the current profile.md, which the user can change at any
-// time, and SQLite already stores the most recent score per job.
+// scoreCache is a process-local in-memory cache. Not persisted because scores
+// depend on profile.md which can change at any time, and SQLite already stores
+// the most recent score per job.
 //
 // The cache key incorporates the profile hash, so editing profile.md
 // automatically invalidates everything.
@@ -18,8 +18,9 @@ type scoreCache struct {
 }
 
 type cachedScore struct {
-	Score  int
-	Reason string
+	Score       int
+	Reason      string
+	MatchedTech []string
 }
 
 func newScoreCache() *scoreCache {
@@ -44,14 +45,12 @@ func (c *scoreCache) get(key string) (cachedScore, bool) {
 	return e, ok
 }
 
-func (c *scoreCache) put(key string, score int, reason string) {
+func (c *scoreCache) put(key string, score int, reason string, matched []string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.entries[key] = cachedScore{Score: score, Reason: reason}
+	c.entries[key] = cachedScore{Score: score, Reason: reason, MatchedTech: matched}
 }
 
-// Reset clears the cache. Useful when the candidate updates their profile
-// or wants to force re-scoring.
 func (c *scoreCache) reset() {
 	c.mu.Lock()
 	defer c.mu.Unlock()

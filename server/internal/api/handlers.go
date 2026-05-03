@@ -28,11 +28,21 @@ type Handler struct {
 	profilePath string
 }
 
+// scrapeResult is what one scrape goroutine produces per (source, query) pair.
+// Defined at package level so scrapeQueriesSequentially can take a typed channel
+// rather than an anonymous-struct one (which doesn't compose across functions).
+type scrapeResult struct {
+	source string
+	query  string
+	jobs   []*models.Job
+	err    error
+}
+
 func NewHandler(s *store.Store, m *matcher.Matcher, profilePath string) *Handler {
 	return &Handler{store: s, matcher: m, profilePath: profilePath}
 }
 
-// --- Profile ---
+// ─── Profile ─────────────────────────────────────────────────────────────────
 
 func (h *Handler) GetProfile(w http.ResponseWriter, r *http.Request) {
 	data, err := os.ReadFile(h.profilePath)
@@ -55,10 +65,13 @@ func (h *Handler) SaveProfile(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	// Editing the profile invalidates the in-memory score cache; the next
+	// refresh should re-evaluate everything against the new profile hash.
+	h.matcher.ResetCache()
 	jsonOK(w, map[string]string{"ok": "saved"})
 }
 
-// --- Jobs list ---
+// ─── Jobs list ───────────────────────────────────────────────────────────────
 
 func (h *Handler) ListJobs(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
@@ -78,7 +91,19 @@ func (h *Handler) ListJobs(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, jobs)
 }
 
-// --- SSE refresh stream ---
+// ─── SSE refresh stream ──────────────────────────────────────────────────────
+//
+// Lifecycle:
+//   1. Phase 1 (scrape): per source × per query, a goroutine fetches jobs.
+//   2. Dedup by URL.
+//   3. Phase 2 (pipelined): hydration workers fetch missing LinkedIn descriptions
+//      and forward them on a channel; scoring workers pick up each job as soon
+//      as its description is ready and run the two-stage matcher.
+//   4. Done.
+//
+// The pipeline phase replaces what used to be two sequential phases (hydrate-all
+// → score-all). Wall-clock time is now bounded by the slower of the two pools
+// rather than their sum.
 
 type sseEvent struct {
 	Type string `json:"type"`
@@ -94,6 +119,9 @@ type sseEvent struct {
 
 	// dedup
 	Unique int `json:"unique,omitempty"`
+
+	// hydrate_progress
+	Hydrated int `json:"hydrated,omitempty"`
 
 	// scoring
 	Current int    `json:"current,omitempty"`
@@ -121,11 +149,10 @@ func (h *Handler) RefreshJobsStream(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
 	defer cancel()
 
-	// send is called from multiple goroutines (scrapers, hydration workers,
-	// scoring workers). Without the mutex, concurrent writes to the SSE
-	// response can interleave bytes mid-event and break JSON parsing on
-	// the client. The mutex serialises writes; events are small so contention
-	// is negligible.
+	// `send` is called from many goroutines (scrapers, hydration workers, scoring
+	// workers). Without the mutex, concurrent writes interleave bytes mid-event
+	// and break JSON parsing on the client. Events are small so contention is
+	// negligible.
 	var sendMu sync.Mutex
 	send := func(ev sseEvent) {
 		sendMu.Lock()
@@ -138,7 +165,6 @@ func (h *Handler) RefreshJobsStream(w http.ResponseWriter, r *http.Request) {
 	profile := h.readProfile()
 	cfg := ParseSearchConfig(profile)
 
-	// Determine which sources to scrape (defaults to all three)
 	wantSources := map[string]bool{"adzuna": true, "linkedin": true}
 	if sp := r.URL.Query().Get("sources"); sp != "" {
 		wantSources = map[string]bool{}
@@ -147,21 +173,21 @@ func (h *Handler) RefreshJobsStream(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	radius := 50 // km default
+	radius := 50
 	if rv := r.URL.Query().Get("radius"); rv != "" {
 		if n, err := strconv.Atoi(rv); err == nil && n > 0 {
 			radius = n
 		}
 	}
 
-	maxJobs := 50 // balanced cap across queries
+	maxJobs := 50
 	if mj := r.URL.Query().Get("maxJobs"); mj != "" {
 		if n, err := strconv.Atoi(mj); err == nil {
-			maxJobs = n // 0 means no limit
+			maxJobs = n // 0 = no limit
 		}
 	}
 
-	maxDaysOld := 0 // 0 = no limit
+	maxDaysOld := 0
 	switch r.URL.Query().Get("dateRange") {
 	case "today":
 		maxDaysOld = 1
@@ -174,68 +200,29 @@ func (h *Handler) RefreshJobsStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	totalScrapes := len(cfg.Queries) * len(wantSources)
-	slog.Info("refresh.start", "sources", wantSources, "queries", len(cfg.Queries), "radius_km", radius, "max_jobs", maxJobs, "max_days_old", maxDaysOld)
+	slog.Info("refresh.start", "sources", wantSources, "queries", len(cfg.Queries),
+		"radius_km", radius, "max_jobs", maxJobs, "max_days_old", maxDaysOld)
 	send(sseEvent{Type: "scrape_start", Total: totalScrapes})
 
-	// --- Phase 1: scrape selected sources concurrently ---
-	type scrapeResult struct {
-		source string
-		query  string
-		jobs   []*models.Job
-		err    error
-	}
-
+	// ── Phase 1: scrape ─────────────────────────────────────────────────
 	ch := make(chan scrapeResult, totalScrapes)
 
-	// LinkedIn: sequential with a short delay to avoid 429 rate-limiting.
-	// Firing all 30 goroutines at once reliably triggers LinkedIn's bot detection.
 	if wantSources["linkedin"] {
-		go func() {
-			for i, q := range cfg.Queries {
-				if ctx.Err() != nil {
-					ch <- scrapeResult{source: "linkedin", query: q, err: ctx.Err()}
-					continue
-				}
-				if i > 0 {
-					select {
-					case <-ctx.Done():
-						ch <- scrapeResult{source: "linkedin", query: q, err: ctx.Err()}
-						continue
-					case <-time.After(500 * time.Millisecond):
-					}
-				}
-				jobs, err := scrapers.NewLinkedIn(q, cfg.Location, cfg.City, radius, maxDaysOld).Fetch()
-				ch <- scrapeResult{"linkedin", q, jobs, err}
-			}
-		}()
+		go scrapeQueriesSequentially(ctx, "linkedin", cfg.Queries, 500*time.Millisecond, ch,
+			func(q string) ([]*models.Job, error) {
+				return scrapers.NewLinkedIn(q, cfg.Location, cfg.City, radius, maxDaysOld).Fetch()
+			})
 	}
-
-	// Adzuna: sequential with delay to respect trial rate limits
 	if wantSources["adzuna"] {
-		go func() {
-			appID := os.Getenv("ADZUNA_APP_ID")
-			appKey := os.Getenv("ADZUNA_APP_KEY")
-			for i, q := range cfg.Queries {
-				if ctx.Err() != nil {
-					ch <- scrapeResult{source: "adzuna", query: q, err: ctx.Err()}
-					continue
-				}
-				if i > 0 {
-					select {
-					case <-ctx.Done():
-						ch <- scrapeResult{source: "adzuna", query: q, err: ctx.Err()}
-						continue
-					case <-time.After(700 * time.Millisecond):
-					}
-				}
-				jobs, err := scrapers.NewAdzuna(q, appID, appKey, cfg.City, radius, maxDaysOld).Fetch()
-				ch <- scrapeResult{"adzuna", q, jobs, err}
-			}
-		}()
+		appID := os.Getenv("ADZUNA_APP_ID")
+		appKey := os.Getenv("ADZUNA_APP_KEY")
+		go scrapeQueriesSequentially(ctx, "adzuna", cfg.Queries, 700*time.Millisecond, ch,
+			func(q string) ([]*models.Job, error) {
+				return scrapers.NewAdzuna(q, appID, appKey, cfg.City, radius, maxDaysOld).Fetch()
+			})
 	}
 
-	// Collect results, deduping by URL across queries.
-	queryJobs := map[string][]*models.Job{} // query → jobs (deduped per query)
+	queryJobs := map[string][]*models.Job{}
 	seenURL := map[string]bool{}
 	scrapeErrors := map[string]string{}
 	rawTotal := 0
@@ -246,19 +233,19 @@ func (h *Handler) RefreshJobsStream(w http.ResponseWriter, r *http.Request) {
 			key := res.query + "/" + res.source
 			scrapeErrors[key] = res.err.Error()
 			send(sseEvent{Type: "source_error", Source: res.source, Query: res.query, Error: res.err.Error()})
-		} else {
-			rawTotal += len(res.jobs)
-			for _, j := range res.jobs {
-				if !seenURL[j.URL] {
-					seenURL[j.URL] = true
-					queryJobs[res.query] = append(queryJobs[res.query], j)
-				}
-			}
-			send(sseEvent{Type: "source_done", Source: res.source, Query: res.query, Count: len(res.jobs)})
+			continue
 		}
+		rawTotal += len(res.jobs)
+		for _, j := range res.jobs {
+			if !seenURL[j.URL] {
+				seenURL[j.URL] = true
+				queryJobs[res.query] = append(queryJobs[res.query], j)
+			}
+		}
+		send(sseEvent{Type: "source_done", Source: res.source, Query: res.query, Count: len(res.jobs)})
 	}
 
-	// Sort each query bucket by recency (newest first) so we pick fresh jobs first
+	// Sort each bucket newest-first.
 	for q, jobs := range queryJobs {
 		sort.Slice(jobs, func(i, j int) bool {
 			return jobs[i].PostedAt.After(jobs[j].PostedAt)
@@ -266,37 +253,33 @@ func (h *Handler) RefreshJobsStream(w http.ResponseWriter, r *http.Request) {
 		queryJobs[q] = jobs
 	}
 
-	// Build stable query order for round-robin
 	queryOrder := make([]string, 0, len(queryJobs))
 	for q := range queryJobs {
 		queryOrder = append(queryOrder, q)
 	}
 	sort.Strings(queryOrder)
 
-	// Select jobs: round-robin across query buckets to maximise diversity.
-	// Each pass takes 1 job from each bucket (the freshest not yet taken).
-	// Stops when maxJobs is reached or all buckets are exhausted.
+	// Round-robin to maximise diversity across queries until maxJobs is reached.
 	var unique []*models.Job
 	if maxJobs == 0 {
 		for _, q := range queryOrder {
 			unique = append(unique, queryJobs[q]...)
 		}
 	} else {
-		offsets := make(map[string]int)
+		offsets := map[string]int{}
 		for len(unique) < maxJobs {
-			madeProgress := false
+			progress := false
 			for _, q := range queryOrder {
 				if len(unique) >= maxJobs {
 					break
 				}
-				off := offsets[q]
-				if off < len(queryJobs[q]) {
+				if off := offsets[q]; off < len(queryJobs[q]) {
 					unique = append(unique, queryJobs[q][off])
 					offsets[q]++
-					madeProgress = true
+					progress = true
 				}
 			}
-			if !madeProgress {
+			if !progress {
 				break
 			}
 		}
@@ -305,112 +288,112 @@ func (h *Handler) RefreshJobsStream(w http.ResponseWriter, r *http.Request) {
 	slog.Info("refresh.dedup", "raw_total", rawTotal, "unique_after_dedup", len(unique), "errors", len(scrapeErrors))
 	send(sseEvent{Type: "dedup", Unique: len(unique), Total: rawTotal})
 
-	// --- Phase 1.5: hydrate LinkedIn job descriptions ---
-	// LinkedIn's search-results page only carries titles + URLs, not descriptions.
-	// The matcher needs the full text to score accurately — without this step
-	// every LinkedIn job lands at score ~10-15 (no tech overlap detected).
-	// We fetch each detail page concurrently, with a bounded pool to avoid
-	// triggering LinkedIn's rate limiter.
-	var hydrateTotal int
-	for _, j := range unique {
-		if j.Source == "linkedin" && j.Description == "" {
-			hydrateTotal++
+	// ── Phase 2: pipelined hydration + scoring ──────────────────────────
+	candidateIdx := matcher.BuildCandidateIndex(profile)
+	slog.Info("refresh.candidate_index",
+		"techs", len(candidateIdx.Tech),
+		"roles", len(candidateIdx.RoleKeywords),
+		"profile_hash", candidateIdx.Hash,
+		"model", h.matcher.Model())
+
+	hydrateConcurrency := 4
+	if v := os.Getenv("HYDRATE_CONCURRENCY"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			hydrateConcurrency = n
 		}
 	}
-	if hydrateTotal > 0 {
-		send(sseEvent{Type: "hydrate_start", Total: hydrateTotal})
+	scoreConcurrency := 4
+	if v := os.Getenv("OLLAMA_NUM_PARALLEL"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			scoreConcurrency = n
+		}
 	}
-	hydrateConcurrency := 4
+
+	// scoreCh feeds scoring workers. Buffered so hydration workers don't
+	// block when scoring is the slower stage (typical when LLM is involved).
+	scoreCh := make(chan *models.Job, len(unique))
+
+	// 1. Hydration pool. Reads jobs from `unique`, fetches LinkedIn descriptions
+	//    when needed (Adzuna jobs already have descriptions), pushes to scoreCh.
 	hydrateSem := make(chan struct{}, hydrateConcurrency)
 	var hydrateWG sync.WaitGroup
 	var hydrated atomic.Int32
-	var hydrateFailed atomic.Int32
-	var hydrateProgress atomic.Int32
+
+	// Count how many we'll actually hydrate so the UI can show meaningful progress.
+	var toHydrate int
+	for _, j := range unique {
+		if j.Source == "linkedin" && j.Description == "" {
+			toHydrate++
+		}
+	}
+	if toHydrate > 0 {
+		send(sseEvent{Type: "hydrate_start", Total: toHydrate})
+	}
+
 	for _, job := range unique {
-		if job.Source != "linkedin" || job.Description != "" {
+		j := job
+		if j.Source != "linkedin" || j.Description != "" {
+			// Already has a description — push straight to scoring.
+			scoreCh <- j
 			continue
 		}
-		j := job
-		hydrateSem <- struct{}{}
 		hydrateWG.Add(1)
+		hydrateSem <- struct{}{}
 		go func() {
 			defer func() {
 				<-hydrateSem
 				hydrateWG.Done()
 			}()
-			dctx, dcancel := context.WithTimeout(ctx, 10*time.Second)
+			dctx, dcancel := context.WithTimeout(ctx, 12*time.Second)
 			defer dcancel()
 			desc, err := scrapers.FetchLinkedInDescription(dctx, j.URL)
-			if err != nil || desc == "" {
-				hydrateFailed.Add(1)
-				if err != nil {
-					slog.Debug("linkedin.detail_failed", "url", j.URL, "err", err)
-				}
-			} else {
+			if err == nil && desc != "" {
 				j.Description = desc
-				hydrated.Add(1)
+			} else if err != nil {
+				slog.Debug("linkedin.detail_failed", "url", j.URL, "err", err)
 			}
-			n := int(hydrateProgress.Add(1))
-			send(sseEvent{Type: "hydrate_progress", Current: n, Total: hydrateTotal})
+			n := int(hydrated.Add(1))
+			send(sseEvent{Type: "hydrate_progress", Current: n, Total: toHydrate})
+			// Whether or not we got a description, push the job — the matcher
+			// will gracefully score with whatever we have.
+			scoreCh <- j
 		}()
 	}
-	hydrateWG.Wait()
-	slog.Info("refresh.hydrate", "fetched", hydrated.Load(), "failed", hydrateFailed.Load(), "total", len(unique))
 
-	// --- Phase 2: score with the two-stage pipeline ---
-	// Stage 1 (deterministic) runs synchronously on every job in microseconds.
-	// Stage 2 (LLM referee) runs concurrently only on jobs in the uncertainty
-	// band, and is skipped via cache for previously-seen (job, profile) pairs.
-	candidateIdx := matcher.BuildCandidateIndex(profile)
-	slog.Info("refresh.candidate_index",
-		"techs", len(candidateIdx.TechTokens),
-		"roles", len(candidateIdx.RoleKeywords),
-		"profile_hash", candidateIdx.Hash,
-		"model", h.matcher.Model())
+	// Close scoreCh once all hydration is done so scoring workers know to stop.
+	go func() {
+		hydrateWG.Wait()
+		close(scoreCh)
+	}()
 
-	ollamaParallel := 4
-	if op := os.Getenv("OLLAMA_NUM_PARALLEL"); op != "" {
-		if n, err := strconv.Atoi(op); err == nil && n > 0 {
-			ollamaParallel = n
-		}
-	}
+	// 2. Scoring pool. Pulls jobs off scoreCh as they become available.
 	total := len(unique)
 	var scored atomic.Int32
 	var llmCalls atomic.Int32
-	sem := make(chan struct{}, ollamaParallel)
-	var wg sync.WaitGroup
-
-scoreLoop:
-	for _, job := range unique {
-		select {
-		case <-ctx.Done():
-			break scoreLoop
-		default:
-		}
-		sem <- struct{}{}
-		wg.Add(1)
-		go func(j *models.Job) {
-			defer func() {
-				<-sem
-				wg.Done()
-			}()
-
-			score, reason, usedLLM, err := h.matcher.ScoreJob(ctx, j, candidateIdx)
-			if err != nil {
-				slog.Warn("scoring.error", "url", j.URL, "err", err)
+	var scoreWG sync.WaitGroup
+	for i := 0; i < scoreConcurrency; i++ {
+		scoreWG.Add(1)
+		go func() {
+			defer scoreWG.Done()
+			for j := range scoreCh {
+				if ctx.Err() != nil {
+					return
+				}
+				result := h.matcher.ScoreJob(ctx, j, candidateIdx)
+				j.MatchScore = result.Score
+				j.MatchReason = result.Reason
+				j.MatchedTech = result.MatchedTech
+				if result.UsedLLM {
+					llmCalls.Add(1)
+				}
+				_ = h.store.Upsert(j)
+				n := int(scored.Add(1))
+				send(sseEvent{Type: "scoring", Current: n, Total: total,
+					Title: j.Title, Company: j.Company, Score: j.MatchScore})
 			}
-			j.MatchScore = score
-			j.MatchReason = reason
-			if usedLLM {
-				llmCalls.Add(1)
-			}
-
-			_ = h.store.Upsert(j)
-			n := int(scored.Add(1))
-			send(sseEvent{Type: "scoring", Current: n, Total: total, Title: j.Title, Company: j.Company, Score: j.MatchScore})
-		}(job)
+		}()
 	}
-	wg.Wait()
+	scoreWG.Wait()
 
 	slog.Info("refresh.done",
 		"scored", total,
@@ -420,7 +403,36 @@ scoreLoop:
 	send(sseEvent{Type: "done", Fetched: total, Errors: scrapeErrors})
 }
 
-// --- Reset ---
+// scrapeQueriesSequentially fires one query at a time with a fixed delay
+// between them. Sequential pacing avoids tripping the rate limiters of LinkedIn
+// (no API key) and Adzuna (trial tier ~25 calls / minute).
+func scrapeQueriesSequentially(
+	ctx context.Context,
+	source string,
+	queries []string,
+	delay time.Duration,
+	out chan<- scrapeResult,
+	fetch func(string) ([]*models.Job, error),
+) {
+	for i, q := range queries {
+		if ctx.Err() != nil {
+			out <- scrapeResult{source, q, nil, ctx.Err()}
+			continue
+		}
+		if i > 0 {
+			select {
+			case <-ctx.Done():
+				out <- scrapeResult{source, q, nil, ctx.Err()}
+				continue
+			case <-time.After(delay):
+			}
+		}
+		jobs, err := fetch(q)
+		out <- scrapeResult{source, q, jobs, err}
+	}
+}
+
+// ─── Reset ───────────────────────────────────────────────────────────────────
 
 func (h *Handler) ResetJobs(w http.ResponseWriter, r *http.Request) {
 	n, err := h.store.Reset()
@@ -439,7 +451,7 @@ func (h *Handler) ClearNewJobs(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, map[string]string{"ok": "cleared"})
 }
 
-// --- Status update ---
+// ─── Status update ───────────────────────────────────────────────────────────
 
 func (h *Handler) UpdateStatus(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
@@ -457,7 +469,7 @@ func (h *Handler) UpdateStatus(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, map[string]string{"status": string(body.Status)})
 }
 
-// --- Re-analyze single job ---
+// ─── Re-analyze single job ───────────────────────────────────────────────────
 
 func (h *Handler) AnalyzeJob(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
@@ -469,16 +481,16 @@ func (h *Handler) AnalyzeJob(w http.ResponseWriter, r *http.Request) {
 	profile := h.readProfile()
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
-	score, reason, err := h.matcher.Score(ctx, job, profile)
+	score, reason, matched, err := h.matcher.Score(ctx, job, profile)
 	if err != nil {
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	_ = h.store.UpdateMatch(id, score, reason)
-	jsonOK(w, map[string]any{"score": score, "reason": reason})
+	_ = h.store.UpdateMatch(id, score, reason, matched)
+	jsonOK(w, map[string]any{"score": score, "reason": reason, "matchedTech": matched})
 }
 
-// --- Draft email ---
+// ─── Draft email ─────────────────────────────────────────────────────────────
 
 func (h *Handler) DraftEmail(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
@@ -498,7 +510,7 @@ func (h *Handler) DraftEmail(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, draft)
 }
 
-// --- Helpers ---
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
 func (h *Handler) readProfile() string {
 	data, err := os.ReadFile(h.profilePath)

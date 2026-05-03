@@ -3,6 +3,7 @@ import type { Job, JobStatus } from '../types/job'
 import { fetchPipeline, updateStatus, draftEmail } from '../api/client'
 import { SourceBadge } from './SourceBadge'
 import { ScoreRing } from './ScoreRing'
+import { TechBadges } from './TechBadges'
 
 function openGmailCompose(subject: string, body: string) {
   const url = `https://mail.google.com/mail/?view=cm&fs=1&su=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`
@@ -55,6 +56,12 @@ function PipelineCard({ job, onStatusChange }: CardProps) {
         </a>
         <p className="text-sm text-gray-500 mt-0.5">{job.company}{job.location ? ` · ${job.location}` : ''}</p>
 
+        {job.matchedTech && job.matchedTech.length > 0 && (
+          <div className="mt-2">
+            <TechBadges tech={job.matchedTech} maxShown={6} />
+          </div>
+        )}
+
         {job.matchReason && (
           <p className="mt-2 text-sm text-gray-600 italic leading-snug line-clamp-2">{job.matchReason}</p>
         )}
@@ -91,9 +98,7 @@ export function PipelineView() {
   const [error, setError] = useState('')
 
   useEffect(() => {
-    fetchPipeline()
-      .then(setJobs)
-      .catch(e => setError(String(e)))
+    fetchPipeline().then(setJobs).catch(e => setError(String(e)))
   }, [])
 
   async function handleStatusChange(id: string, status: JobStatus) {
