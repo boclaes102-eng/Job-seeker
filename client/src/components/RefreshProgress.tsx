@@ -75,7 +75,7 @@ export function RefreshProgress({ phase, scraped, totalScrapes, hydrated, totalT
       {/* Done */}
       {at === 3 && (
         <p className="text-emerald-600 font-medium">
-          ✓ Done — {totalToScore} unique jobs scored and stored
+          ✓ Done — {scored} jobs scored and stored
         </p>
       )}
 

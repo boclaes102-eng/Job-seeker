@@ -277,42 +277,48 @@ func (h *Handler) RefreshJobsStream(w http.ResponseWriter, r *http.Request) {
 	}
 	sort.Strings(queryOrder)
 
-	// Round-robin to maximise diversity across queries until maxJobs is reached.
-	var unique []*models.Job
-	if maxJobs == 0 {
-		for _, q := range queryOrder {
-			unique = append(unique, queryJobs[q]...)
-		}
-	} else {
-		offsets := map[string]int{}
-		for len(unique) < maxJobs {
-			progress := false
-			for _, q := range queryOrder {
-				if len(unique) >= maxJobs {
-					break
-				}
-				if off := offsets[q]; off < len(queryJobs[q]) {
-					unique = append(unique, queryJobs[q][off])
-					offsets[q]++
-					progress = true
-				}
-			}
-			if !progress {
-				break
-			}
-		}
+	// Flatten all URL-deduped jobs — pre-filter below will rank and cap them.
+	var allUnique []*models.Job
+	for _, q := range queryOrder {
+		allUnique = append(allUnique, queryJobs[q]...)
 	}
 
-	slog.Info("refresh.dedup", "raw_total", rawTotal, "unique_after_dedup", len(unique), "errors", len(scrapeErrors))
-	send(sseEvent{Type: "dedup", Unique: len(unique), Total: rawTotal})
+	slog.Info("refresh.dedup", "raw_total", rawTotal, "unique", len(allUnique), "errors", len(scrapeErrors))
+	send(sseEvent{Type: "dedup", Unique: len(allUnique), Total: rawTotal})
 
-	// ── Phase 2: pipelined hydration + scoring ──────────────────────────
+	// ── Pre-filter: score every unique job deterministically (µs each), keep top maxJobs ──
 	candidateIdx := matcher.BuildCandidateIndex(profile)
 	slog.Info("refresh.candidate_index",
 		"techs", len(candidateIdx.Tech),
 		"roles", len(candidateIdx.RoleKeywords),
 		"profile_hash", candidateIdx.Hash,
 		"model", h.matcher.Model())
+
+	type preScored struct {
+		job   *models.Job
+		score int
+	}
+	ps := make([]preScored, len(allUnique))
+	for i, j := range allUnique {
+		s := matcher.DeterministicScore(j, candidateIdx)
+		ps[i] = preScored{j, s.Total}
+	}
+	sort.SliceStable(ps, func(i, j int) bool { return ps[i].score > ps[j].score })
+
+	limit := len(ps)
+	if maxJobs > 0 && len(ps) > maxJobs {
+		limit = maxJobs
+	}
+	unique := make([]*models.Job, limit)
+	for i := range unique {
+		unique[i] = ps[i].job
+	}
+	if len(allUnique) > limit {
+		slog.Info("refresh.pre_filter", "total_unique", len(allUnique), "kept", limit, "dropped", len(allUnique)-limit)
+		send(sseEvent{Type: "pre_filter", Unique: limit, Total: len(allUnique)})
+	}
+
+	// ── Phase 2: pipelined hydration + scoring ──────────────────────────
 
 	scoreConcurrency := 4
 	if v := os.Getenv("OLLAMA_NUM_PARALLEL"); v != "" {

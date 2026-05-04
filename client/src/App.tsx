@@ -79,6 +79,9 @@ export default function App() {
           case 'dedup':
             log.push(`Dedup: ${ev.total ?? 0} raw → ${ev.unique ?? 0} unique`)
             return { ...prev, totalToScore: ev.unique, log }
+          case 'pre_filter':
+            log.push(`Pre-filter: kept best ${ev.unique ?? 0} of ${ev.total ?? 0} by tech match`)
+            return { ...prev, totalToScore: ev.unique, log }
           case 'hydrate_start':
             log.push(`Fetching ${ev.total ?? 0} LinkedIn descriptions…`)
             return { ...prev, phase: 'hydrating', totalToHydrate: ev.total, log }

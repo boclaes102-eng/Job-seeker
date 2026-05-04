@@ -198,15 +198,15 @@ Job description (truncated):
 %s
 
 Adjustment rules:
-- The candidate "Tech" line above is GROUND TRUTH. NEVER claim the candidate lacks a tech listed there.
-- You may adjust the baseline by AT MOST ±25 points.
-- Do NOT score on location — the user judges distance themselves. Ignore where the job is.
-- Adjust DOWN if: the job requires a major tech the candidate clearly lacks (e.g. Java/Salesforce/SAP/Ruby on Rails) and that tech is the primary requirement; the seniority is a hard mismatch (e.g. "10+ years required"); the role is in a wrong domain (e.g. mechanical engineering, sales, accounting).
-- Adjust UP if: the job description mentions multiple of the candidate's strengths together (e.g. full-stack + cybersecurity); the role explicitly welcomes medior or junior; the company stack is unusually well-aligned with the candidate's projects.
-- Otherwise keep the baseline. Most jobs don't need adjustment.
+- The candidate "Tech" line above is GROUND TRUTH. Never say the candidate lacks a tech that is listed there.
+- Adjust by AT MOST ±25 points from the baseline.
+- Do NOT factor in location.
+- Adjust DOWN if: the primary required tech is something the candidate clearly does not have; seniority is a hard mismatch; the domain is completely wrong.
+- Adjust UP if: the description strongly overlaps with the candidate's actual stack; the role level matches.
+- Otherwise keep the baseline unchanged.
 
-Return ONLY valid JSON, no other text:
-{"score": integer 0-100, "reason": "one specific sentence explaining your decision and naming the primary required tech"}`,
+Return ONLY valid JSON — no other text:
+{"score": integer 0-100, "reason": "one sentence that names the specific job title, the key tech or factor that determined your adjustment, and whether you adjusted up, down, or kept the score"}`,
 		idx.Summary,
 		det.Total,
 		matched,
@@ -240,54 +240,148 @@ func clampAdjustment(baseline, llmScore, maxDelta int) int {
 
 func (m *Matcher) DraftEmail(ctx context.Context, job *models.Job, profile string) (EmailDraft, error) {
 	idx := BuildCandidateIndex(profile)
+	score := DeterministicScore(job, idx)
 
-	prompt := fmt.Sprintf(`You are writing a professional job application email on behalf of the candidate below.
+	// Pick the experience entry most relevant to this job.
+	bestExp := pickBestExperience(profile, job.Title+" "+job.Description)
 
-Rules:
-- Write in the SAME language as the job description (Dutch if Dutch, English if English, French if French).
-- 3–4 short paragraphs: brief intro, why you fit (cite 1–2 specific things from the candidate's tech that match), 1 specific achievement that's relevant, closing with call to action.
-- Be specific — reference the job title and company name explicitly.
-- Do NOT use generic filler ("very motivated", "look forward to hearing from you") without substance.
-- Use the candidate's actual name: Bo Claes. Never "[Your Name]" or similar placeholders.
-- Mention naturally — not boastfully — that this job was discovered via a personal job-scouting tool Bo built (a Go backend that scrapes job boards, scores postings with a local LLM, surfaces best matches).
-- Sign off with: Bo Claes | boclaes102@gmail.com | github.com/boclaes102-eng
-
-%s
-
-Job title: %s
-Company: %s
-Job description:
-%s
-
-Return ONLY valid JSON:
-{"subject": "short professional subject line", "body": "full email body, plain text, newlines as \\n"}`,
-		idx.Summary,
-		job.Title, job.Company,
-		truncate(job.Description, 2000),
-	)
-
-	req := ollamaRequest{
-		Model:     m.model,
-		Messages:  []ollamaMessage{{Role: "user", Content: prompt}},
-		Stream:    false,
-		Format:    "json",
-		KeepAlive: "10m",
-		Options: ollamaOptions{
-			Temperature: 0.4,
-			NumPredict:  600,
-		},
+	// Ask the LLM for ONE sentence only: how the matched tech connects to this role.
+	// Keeping the ask tiny reduces hallucination to near-zero.
+	fitSentence, err := m.generateFitSentence(ctx, job.Title, job.Company, score.MatchedTech)
+	if err != nil {
+		// Fall back to a safe generic sentence — don't fail the whole email.
+		fitSentence = fmt.Sprintf("My background in %s aligns directly with the requirements listed for this role.",
+			joinTech(score.MatchedTech, 3))
 	}
 
+	subject := fmt.Sprintf("Application: %s — Bo Claes", job.Title)
+	body := buildEmailBody(job.Title, job.Company, fitSentence, bestExp)
+	return EmailDraft{Subject: subject, Body: body}, nil
+}
+
+// generateFitSentence asks the LLM for a single sentence explaining the tech match.
+// The prompt is so constrained that hallucination is nearly impossible.
+func (m *Matcher) generateFitSentence(ctx context.Context, title, company string, matchedTech []string) (string, error) {
+	if len(matchedTech) == 0 {
+		return "", fmt.Errorf("no matched tech")
+	}
+	tech := joinTech(matchedTech, 4)
+	prompt := fmt.Sprintf(
+		`Write exactly ONE sentence (max 25 words) explaining how experience with %s is relevant to a %s role at %s. Use only these technologies — do not mention any others. Return plain text, no quotes.`,
+		tech, title, company,
+	)
+	req := ollamaRequest{
+		Model:    m.model,
+		Messages: []ollamaMessage{{Role: "user", Content: prompt}},
+		Stream:   false,
+		Options:  ollamaOptions{Temperature: 0.3, NumPredict: 60},
+	}
 	var resp ollamaResponse
 	if err := m.callOllama(ctx, "/api/chat", req, &resp); err != nil {
-		return EmailDraft{}, err
+		return "", err
+	}
+	s := strings.TrimSpace(resp.Message.Content)
+	s = strings.Trim(s, `"`)
+	if s == "" {
+		return "", fmt.Errorf("empty response")
+	}
+	return s, nil
+}
+
+// pickBestExperience returns the experience entry whose text overlaps most with
+// the job's combined title+description. Falls back to the first entry.
+func pickBestExperience(profile, jobText string) string {
+	expSection := sectionContent(profile, "Experience")
+	if expSection == "" {
+		return ""
+	}
+	// Split into individual bullet entries on lines starting with "- **"
+	var entries []string
+	current := ""
+	for _, line := range strings.Split(expSection, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "- **") && current != "" {
+			entries = append(entries, strings.TrimSpace(current))
+			current = line
+		} else {
+			if current != "" {
+				current += "\n" + line
+			} else {
+				current = line
+			}
+		}
+	}
+	if current != "" {
+		entries = append(entries, strings.TrimSpace(current))
+	}
+	if len(entries) == 0 {
+		return strings.TrimSpace(expSection)
 	}
 
-	var draft EmailDraft
-	if err := json.Unmarshal([]byte(resp.Message.Content), &draft); err != nil {
-		return EmailDraft{}, fmt.Errorf("draft parse: %w", err)
+	jobWords := wordSet(strings.ToLower(jobText))
+	best, bestScore := entries[0], -1
+	for _, e := range entries {
+		score := 0
+		for w := range wordSet(strings.ToLower(e)) {
+			if len(w) > 3 && jobWords[w] {
+				score++
+			}
+		}
+		if score > bestScore {
+			bestScore = score
+			best = e
+		}
 	}
-	return draft, nil
+	// Strip the leading "- " bullet marker and markdown bold markers (**text**).
+	best = strings.TrimPrefix(strings.TrimSpace(best), "- ")
+	best = strings.ReplaceAll(best, "**", "")
+	return best
+}
+
+func buildEmailBody(title, company, fitSentence, bestExp string) string {
+	var b strings.Builder
+	b.WriteString("Dear Hiring Manager,\n\n")
+
+	// Paragraph 1: intro + how the role was found
+	fmt.Fprintf(&b, "I am writing to apply for the %s position at %s. I came across this role via a personal job-scouting tool I built — a Go backend that scrapes job boards and scores postings with a local LLM to surface best matches.\n\n", title, company)
+
+	// Paragraph 2: skill fit (LLM-generated single sentence)
+	b.WriteString(fitSentence)
+	b.WriteString("\n\n")
+
+	// Paragraph 3: most relevant experience entry (verbatim from profile — no hallucination)
+	if bestExp != "" {
+		b.WriteString(bestExp)
+		b.WriteString("\n\n")
+	}
+
+	// Paragraph 4: call to action
+	b.WriteString("I would welcome the opportunity to discuss how my background fits your needs.\n\n")
+
+	b.WriteString("Bo Claes | boclaes102@gmail.com | github.com/boclaes102-eng")
+	return b.String()
+}
+
+func joinTech(tech []string, max int) string {
+	if len(tech) == 0 {
+		return "my technical skills"
+	}
+	if len(tech) > max {
+		tech = tech[:max]
+	}
+	if len(tech) == 1 {
+		return tech[0]
+	}
+	return strings.Join(tech[:len(tech)-1], ", ") + " and " + tech[len(tech)-1]
+}
+
+func wordSet(s string) map[string]bool {
+	m := map[string]bool{}
+	for _, w := range strings.FieldsFunc(s, func(r rune) bool {
+		return !('a' <= r && r <= 'z') && !('0' <= r && r <= '9')
+	}) {
+		m[w] = true
+	}
+	return m
 }
 
 // ─── HTTP plumbing ───────────────────────────────────────────────────────────
