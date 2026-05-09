@@ -121,8 +121,8 @@ var techDefinitions = []techDef{
 	// Infra / DevOps / cloud
 	{"Docker", []string{"docker", "dockerfile"}, "infra", 3},
 	{"Kubernetes", []string{"kubernetes", "k8s"}, "infra", 2},
-	{"GitHub Actions", []string{"github actions", "github ci"}, "infra", 2},
-	{"CI/CD", []string{"ci/cd", "ci / cd", "continuous integration"}, "infra", 2},
+	{"GitHub Actions", []string{"github actions", "github ci", "ci/cd", "ci / cd", "continuous integration", "continuous delivery", "gitlab ci", "gitlab-ci", "jenkins", "circleci", "teamcity", "azure devops pipelines"}, "infra", 2},
+	{"CI/CD", []string{"ci/cd", "ci / cd", "continuous integration", "continuous delivery", "github actions", "github ci", "gitlab ci", "jenkins", "circleci"}, "infra", 2},
 	{"Vercel", []string{"vercel"}, "infra", 1},
 	{"Railway", []string{"railway.app", "railway hosting"}, "infra", 1}, // avoid plain "railway"
 	{"Prometheus", []string{"prometheus"}, "infra", 2},
@@ -185,6 +185,15 @@ var roleKeywordCanon = map[string]string{
 	"node.js developer":    "Node.js developer",
 	"typescript developer": "TypeScript developer",
 	"python developer":     "Python developer",
+	// Teaching
+	"leerkracht":           "IT teacher",
+	"docent":               "IT teacher",
+	"lecturer":             "IT teacher",
+	"it teacher":           "IT teacher",
+	"ict teacher":          "IT teacher",
+	"lector":               "IT teacher",
+	"lesgever":             "IT teacher",
+	"instructeur":          "IT teacher",
 }
 
 // dealBreakerSpecs are conservative patterns that signal the role is a clear
@@ -196,10 +205,18 @@ type dealBreakerSpec struct {
 }
 
 var dealBreakerSpecs = []dealBreakerSpec{
+	// Seniority — title-based (checked against title+description in scorer)
+	{`\b(senior|sr\.?)\s+(developer|engineer|architect|devops|devsecops|analyst|consultant|fullstack|full.stack|backend|frontend|python|java|node|react|ml|ai|data|cloud|security|software|manager|devops)\b`, "Senior role"},
+	{`\bprincipal\s+(engineer|developer|architect|consultant|software)\b`, "Principal/Staff role"},
+	{`\bstaff\s+engineer\b`, "Principal/Staff role"},
+	// Years of experience
+	{`\b([5-9]|1[0-9]|20)\s*\+\s*(years?|jaar|jaren)\b.{0,60}\b(experience|ervaring|expertise|required|vereist)\b`, "5+ years experience required"},
 	{`\b(10|11|12|13|14|15|20)\s*\+?\s*(years?|jaar|jaren)\b.{0,40}\b(experience|ervaring|expertise)\b`, "10+ years experience required"},
-	{`(?:senior|lead|principal|staff|architect)\b.{0,80}(?:8|9|10)\s*\+?\s*(?:years?|jaar)`, "Senior+ title with 8+ year hard requirement"},
+	// Language / clearance / other hard blocks
 	{`\bnative\s+(?:french|français|frans)\b|\bmoedertaal\s+frans\b|\blangue\s+maternelle\s+français`, "Native French speaker required"},
 	{`\b(?:security clearance|veiligheidsmachtiging|nato secret|cosmic top secret)\b`, "Security clearance required"},
+	{`\b(?:stageopdracht|stageplaats|internship|stagiair|stage\s+student|student\s+stage)\b`, "Internship/stage position"},
+	{`\b(?:thesis\s+student|student\s+thesis|thesis\s+worker|bachelorproef|masterproef|eindwerk)\b`, "Thesis/student project"},
 }
 
 // ─── Public API ──────────────────────────────────────────────────────────────
@@ -476,7 +493,21 @@ func uniqueLowered(in []string) []string {
 // the canonical tech list so the LLM has a clean ground-truth signal.
 func buildSummary(profile string, idx *CandidateIndex) string {
 	var b strings.Builder
-	b.WriteString("Candidate: medior full-stack / IoT / cybersecurity engineer based in Leuven, Belgium.\n\n")
+
+	// Extract "Based in:" from the About me section for an accurate location header.
+	location := "Belgium"
+	if about := sectionContent(profile, "About me"); about != "" {
+		for _, line := range strings.Split(about, "\n") {
+			lc := strings.ToLower(line)
+			if strings.Contains(lc, "based in:") {
+				if parts := strings.SplitN(line, ":", 2); len(parts) == 2 {
+					location = strings.TrimSpace(parts[1])
+				}
+				break
+			}
+		}
+	}
+	b.WriteString("Candidate profile — location: " + location + "\n\n")
 
 	if about := sectionContent(profile, "About me"); about != "" {
 		first := firstParagraph(about)

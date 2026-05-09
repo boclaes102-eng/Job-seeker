@@ -1,4 +1,11 @@
 export type DateRange = 'all' | 'today' | '3days' | 'week' | 'month'
+export type Seniority = 'all' | 'junior' | 'medior'
+
+const SENIORITY_OPTIONS: { value: Seniority; label: string }[] = [
+  { value: 'all', label: 'All levels' },
+  { value: 'junior', label: 'Junior' },
+  { value: 'medior', label: 'Medior' },
+]
 
 const DATE_OPTIONS: { value: DateRange; label: string }[] = [
   { value: 'all', label: 'Any date' },
@@ -32,19 +39,21 @@ interface Props {
   radius: number
   maxJobs: number
   selectedSources: string[]
+  seniority: Seniority
   hasJobs: boolean
   loading: boolean
   onDateChange: (v: DateRange) => void
   onRadiusChange: (v: number) => void
   onMaxJobsChange: (v: number) => void
   onSourcesChange: (v: string[]) => void
+  onSeniorityChange: (v: Seniority) => void
   onRefresh: () => void
   onReset: () => void
 }
 
 export function FilterBar({
-  dateRange, radius, maxJobs, selectedSources, hasJobs, loading,
-  onDateChange, onRadiusChange, onMaxJobsChange, onSourcesChange, onRefresh, onReset,
+  dateRange, radius, maxJobs, selectedSources, seniority, hasJobs, loading,
+  onDateChange, onRadiusChange, onMaxJobsChange, onSourcesChange, onSeniorityChange, onRefresh, onReset,
 }: Props) {
   function toggleSource(src: string) {
     if (selectedSources.includes(src)) {
@@ -83,6 +92,25 @@ export function FilterBar({
                 </button>
               )
             })}
+          </div>
+        </div>
+
+        <div className="flex flex-col gap-1.5">
+          <label className="text-xs font-medium text-gray-500">Seniority</label>
+          <div className="flex gap-1.5">
+            {SENIORITY_OPTIONS.map(o => (
+              <button
+                key={o.value}
+                onClick={() => onSeniorityChange(o.value)}
+                className={`px-3 py-1.5 rounded-full text-xs font-medium border transition-colors ${
+                  seniority === o.value
+                    ? 'bg-indigo-600 border-indigo-600 text-white'
+                    : 'bg-white border-gray-300 text-gray-500 hover:border-indigo-400 hover:text-indigo-600'
+                }`}
+              >
+                {o.label}
+              </button>
+            ))}
           </div>
         </div>
 

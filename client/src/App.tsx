@@ -2,7 +2,7 @@ import { useEffect, useState, useCallback, useRef } from 'react'
 import type { Job, JobStatus } from './types/job'
 import { fetchJobs, updateStatus, analyzeJob, resetJobs } from './api/client'
 import { JobCard } from './components/JobCard'
-import { FilterBar, type DateRange } from './components/FilterBar'
+import { FilterBar, type DateRange, type Seniority } from './components/FilterBar'
 import { SourceTabs } from './components/SourceTabs'
 import { ProfileEditor } from './components/ProfileEditor'
 import { PipelineView } from './components/PipelineView'
@@ -26,6 +26,13 @@ interface Progress {
 }
 
 
+function detectSeniority(title: string): 'junior' | 'medior' | 'unspecified' {
+  const t = title.toLowerCase()
+  if (/\b(medior|mid-?level|intermediate)\b/.test(t)) return 'medior'
+  if (/\b(junior|jr\.?|entry[- ]?level|starter|graduate|trainee)\b/.test(t)) return 'junior'
+  return 'unspecified'
+}
+
 export default function App() {
   const [tab, setTab] = useState<Tab>('jobs')
   const [allJobs, setAllJobs] = useState<Job[]>([])
@@ -34,6 +41,7 @@ export default function App() {
   const [dateRange, setDateRange] = useState<DateRange>('all')
   const [radius, setRadius] = useState(50)
   const [maxJobs, setMaxJobs] = useState(50)
+  const [seniority, setSeniority] = useState<Seniority>('medior')
   const [progress, setProgress] = useState<Progress | null>(null)
   const [analyzingId, setAnalyzingId] = useState<string | null>(null)
   const esRef = useRef<EventSource | null>(null)
@@ -128,9 +136,13 @@ export default function App() {
     }
   }
 
-  // Source tab filters the display; all other filters are scraping-only params
+  // Source tab + seniority filter the display; scraping params are passed to the API only
   const bySource = viewSource ? allJobs.filter(j => j.source === viewSource) : allJobs
-  const sorted = [...bySource].sort((a, b) => b.matchScore - a.matchScore || new Date(b.fetchedAt).getTime() - new Date(a.fetchedAt).getTime())
+  const bySeniority = seniority === 'all' ? bySource : bySource.filter(j => {
+    const level = detectSeniority(j.title)
+    return level === seniority || level === 'unspecified'
+  })
+  const sorted = [...bySeniority].sort((a, b) => b.matchScore - a.matchScore || new Date(b.fetchedAt).getTime() - new Date(a.fetchedAt).getTime())
 
   const counts: Record<string, number> = {
     '': allJobs.length,
@@ -168,12 +180,14 @@ export default function App() {
               radius={radius}
               maxJobs={maxJobs}
               selectedSources={selectedSources}
+              seniority={seniority}
               hasJobs={allJobs.length > 0}
               loading={isRefreshing}
               onDateChange={setDateRange}
               onRadiusChange={setRadius}
               onMaxJobsChange={setMaxJobs}
               onSourcesChange={setSelectedSources}
+              onSeniorityChange={setSeniority}
               onRefresh={handleRefresh}
               onReset={handleReset}
             />

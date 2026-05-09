@@ -99,7 +99,10 @@ func DeterministicScore(job *models.Job, idx *CandidateIndex) ScoreBreakdown {
 	// a broad vocabulary, what techs the JOB asks for and how many the
 	// candidate has. This catches missing-but-required techs (e.g. job wants
 	// Vue.js, candidate doesn't have it) which the candidate-only vocab misses.
-	requirements := findRequirementSection(job.Description)
+	// Prepend the job title to the requirements text so technologies named in
+	// the title (e.g. "Java Backend Developer") are always treated as required,
+	// even if the description buries them outside the requirements section.
+	requirements := job.Title + " " + findRequirementSection(job.Description)
 	requirementsLC := strings.ToLower(requirements)
 	if requirementsLC != "" {
 		jobTechs := detectTechsInText(requirementsLC, ensureJobVocabulary())
@@ -157,8 +160,11 @@ func DeterministicScore(job *models.Job, idx *CandidateIndex) ScoreBreakdown {
 	if total > 100 {
 		total = 100
 	}
+	// Check deal-breakers against title + description so senior titles are caught
+	// even when the job description itself doesn't repeat the seniority level.
+	dealText := combined
 	for _, db := range idx.DealBreakers {
-		if db.Pattern.MatchString(job.Description) {
+		if db.Pattern.MatchString(dealText) {
 			out.DealBreaker = db.Label
 			if total > 25 {
 				total = 25

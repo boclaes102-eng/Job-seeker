@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -149,15 +150,43 @@ func (m *Matcher) refineWithLLM(ctx context.Context, job *models.Job, idx *Candi
 		return det.Total, det.Reason, fmt.Errorf("llm json parse: %w (content=%q)", err, content)
 	}
 
-	// Sanity-clamp: refuse adjustments greater than ±25 points from the
-	// deterministic anchor. The LLM is a referee, not a re-scorer.
-	final := clampAdjustment(det.Total, result.Score, 25)
-
 	reason := strings.TrimSpace(result.Reason)
 	if reason == "" {
 		reason = det.Reason
 	}
+
+	// The model sometimes writes "80/100 —" in the reason but a different
+	// number in the score field. Parse the leading score from the reason and
+	// use that as the authoritative value — it's what the model committed to
+	// in plain text before producing the JSON.
+	if n := parseLeadingScore(reason); n >= 0 {
+		result.Score = n
+	}
+
+	// Sanity-clamp: refuse adjustments greater than ±25 points from the
+	// deterministic anchor. The LLM is a referee, not a re-scorer.
+	final := clampAdjustment(det.Total, result.Score, 25)
 	return final, reason, nil
+}
+
+// parseLeadingScore extracts the score from a reason string that starts with
+// "72/100 — " or "72/100: " etc. Returns -1 if no such prefix is found.
+func parseLeadingScore(reason string) int {
+	// Look for a number immediately followed by "/100"
+	idx := strings.Index(reason, "/100")
+	if idx <= 0 {
+		return -1
+	}
+	// Walk backwards to find the start of the number
+	start := idx - 1
+	for start > 0 && reason[start-1] >= '0' && reason[start-1] <= '9' {
+		start--
+	}
+	n, err := strconv.Atoi(reason[start:idx])
+	if err != nil || n < 0 || n > 100 {
+		return -1
+	}
+	return n
 }
 
 // buildRefinePrompt is intentionally compact and structured. The LLM gets:
@@ -182,39 +211,42 @@ func buildRefinePrompt(job *models.Job, idx *CandidateIndex, det ScoreBreakdown)
 		roleMatch = "(no role keyword in title)"
 	}
 
-	return fmt.Sprintf(`You are a job-fit referee. A deterministic algorithm has already scored a job posting; your job is to slightly adjust the score based on context the algorithm cannot see.
+	// NOTE: we intentionally do NOT pass the full candidate tech list here.
+	// Passing it caused the LLM to do its own semantic matching against the
+	// job description (e.g. "Azure OpenAI ≈ Anthropic Claude"), inventing
+	// overlaps the deterministic scorer never confirmed.
+	// The LLM's only job here is to judge IMPORTANCE of already-found matches,
+	// not to discover new ones.
+	return fmt.Sprintf(`You are adjusting a job-match score. The tech matching is already done — your only job is to judge whether the confirmed matches are PRIMARY requirements of this job, and whether the missing techs are deal-breakers.
 
+Job: %s at %s
+Baseline: %d/100
+Role match: %s
+
+CONFIRMED MATCHES (candidate has these AND they appear in the job description):
 %s
 
-Deterministic baseline: %d / 100
-- candidate techs found in this job: %s
-- techs the job requires but candidate lacks: %s
-- title role match: %s
-
-Job title: %s
-Company: %s
-Location: %s
-Job description (truncated):
+JOB REQUIRES BUT CANDIDATE LACKS:
 %s
 
-Adjustment rules:
-- The candidate "Tech" line above is GROUND TRUTH. Never say the candidate lacks a tech that is listed there.
-- Adjust by AT MOST ±25 points from the baseline.
+Job description (use ONLY to judge if matched/missing techs are primary or secondary requirements):
+%s
+
+Rules:
+- Adjust UP (max +25) if the CONFIRMED MATCHES are core/primary requirements of this job.
+- Adjust DOWN (max -25) if the JOB REQUIRES items are the primary focus and candidate clearly lacks them; or the domain is completely wrong (mechanical, pharma, accounting).
+- Keep the baseline if uncertain or if matches and gaps are balanced.
+- Do NOT identify any tech overlaps beyond CONFIRMED MATCHES above. Do NOT reference any technology not in those two lists.
 - Do NOT factor in location.
-- Adjust DOWN if: the primary required tech is something the candidate clearly does not have; seniority is a hard mismatch; the domain is completely wrong.
-- Adjust UP if: the description strongly overlaps with the candidate's actual stack; the role level matches.
-- Otherwise keep the baseline unchanged.
 
-Return ONLY valid JSON — no other text:
-{"score": integer 0-100, "reason": "one sentence that names the specific job title, the key tech or factor that determined your adjustment, and whether you adjusted up, down, or kept the score"}`,
-		idx.Summary,
+The reason MUST start with the score you chose, e.g. "72/100 — ".
+Return ONLY valid JSON:
+{"score": integer 0-100, "reason": "<score>/100 — one sentence referencing only techs from the two lists above"}`,
+		job.Title, job.Company,
 		det.Total,
+		roleMatch,
 		matched,
 		missing,
-		roleMatch,
-		job.Title,
-		job.Company,
-		job.Location,
 		truncate(job.Description, 1500),
 	)
 }

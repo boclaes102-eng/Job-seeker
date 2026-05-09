@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -149,6 +150,8 @@ func (h *Handler) RefreshJobsStream(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
 	defer cancel()
 
+	runID := time.Now().Format("2006-01-02T15-04-05")
+
 	// `send` is called from many goroutines (scrapers, hydration workers, scoring
 	// workers). Without the mutex, concurrent writes interleave bytes mid-event
 	// and break JSON parsing on the client. Events are small so contention is
@@ -255,8 +258,17 @@ func (h *Handler) RefreshJobsStream(w http.ResponseWriter, r *http.Request) {
 		}
 		rawTotal += len(res.jobs)
 		for _, j := range res.jobs {
-			if !seenURL[j.URL] {
+			// Hard exclude: senior/lead/principal titles are never relevant.
+			if isSeniorTitle(j.Title) {
+				continue
+			}
+			// Primary dedup: exact URL match.
+			// Secondary dedup: same (title, company) — catches the same job posted
+			// under multiple LinkedIn job IDs (common with agencies and large companies).
+			titleCompanyKey := strings.ToLower(strings.TrimSpace(j.Title)) + "|" + strings.ToLower(strings.TrimSpace(j.Company))
+			if !seenURL[j.URL] && !seenURL[titleCompanyKey] {
 				seenURL[j.URL] = true
+				seenURL[titleCompanyKey] = true
 				queryJobs[res.query] = append(queryJobs[res.query], j)
 			}
 		}
@@ -295,13 +307,14 @@ func (h *Handler) RefreshJobsStream(w http.ResponseWriter, r *http.Request) {
 		"model", h.matcher.Model())
 
 	type preScored struct {
-		job   *models.Job
-		score int
+		job       *models.Job
+		score     int
+		breakdown matcher.ScoreBreakdown
 	}
 	ps := make([]preScored, len(allUnique))
 	for i, j := range allUnique {
 		s := matcher.DeterministicScore(j, candidateIdx)
-		ps[i] = preScored{j, s.Total}
+		ps[i] = preScored{j, s.Total, s}
 	}
 	sort.SliceStable(ps, func(i, j int) bool { return ps[i].score > ps[j].score })
 
@@ -309,13 +322,60 @@ func (h *Handler) RefreshJobsStream(w http.ResponseWriter, r *http.Request) {
 	if maxJobs > 0 && len(ps) > maxJobs {
 		limit = maxJobs
 	}
-	unique := make([]*models.Job, limit)
-	for i := range unique {
-		unique[i] = ps[i].job
+
+	// Teaching jobs score low (no tech in title) but are high-priority.
+	// Guarantee them a spot regardless of the competitive pre-filter cut-off.
+	keptURLs := make(map[string]bool, limit)
+	var unique []*models.Job
+	for i := 0; i < len(ps); i++ {
+		if isTeachingRole(ps[i].job.Title) {
+			keptURLs[ps[i].job.URL] = true
+			unique = append(unique, ps[i].job)
+		}
+	}
+	teachingCount := len(unique)
+	remaining := limit - teachingCount
+	if remaining < 0 {
+		remaining = 0
+	}
+	added := 0
+	for i := 0; i < len(ps) && added < remaining; i++ {
+		if !keptURLs[ps[i].job.URL] {
+			keptURLs[ps[i].job.URL] = true
+			unique = append(unique, ps[i].job)
+			added++
+		}
+	}
+	if teachingCount > 0 {
+		slog.Info("refresh.pre_filter_teaching", "guaranteed", teachingCount)
 	}
 	if len(allUnique) > limit {
 		slog.Info("refresh.pre_filter", "total_unique", len(allUnique), "kept", limit, "dropped", len(allUnique)-limit)
 		send(sseEvent{Type: "pre_filter", Unique: limit, Total: len(allUnique)})
+	}
+
+	// Write every scraped job to the audit table so we can review what was kept/dropped.
+	now := time.Now()
+	auditRecords := make([]*models.AuditRecord, len(ps))
+	for i, p := range ps {
+		auditRecords[i] = &models.AuditRecord{
+			ID:          p.job.ID,
+			RunID:       runID,
+			URL:         p.job.URL,
+			Title:       p.job.Title,
+			Company:     p.job.Company,
+			Location:    p.job.Location,
+			Source:      p.job.Source,
+			PostedAt:    p.job.PostedAt,
+			DetScore:    p.score,
+			MatchedTech: p.breakdown.MatchedTech,
+			MissingTech: p.breakdown.MissingTech,
+			WasKept:     keptURLs[p.job.URL],
+			ScrapedAt:   now,
+		}
+	}
+	if err := h.store.BulkInsertAudit(auditRecords); err != nil {
+		slog.Warn("audit.insert_failed", "err", err)
 	}
 
 	// ── Phase 2: pipelined hydration + scoring ──────────────────────────
@@ -411,6 +471,7 @@ func (h *Handler) RefreshJobsStream(w http.ResponseWriter, r *http.Request) {
 					llmCalls.Add(1)
 				}
 				_ = h.store.Upsert(j)
+				_ = h.store.UpdateAuditFinal(j.ID, runID, result.Score, result.Reason, result.UsedLLM)
 				n := int(scored.Add(1))
 				send(sseEvent{Type: "scoring", Current: n, Total: total,
 					Title: j.Title, Company: j.Company, Score: j.MatchScore})
@@ -536,12 +597,74 @@ func (h *Handler) DraftEmail(w http.ResponseWriter, r *http.Request) {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+// ─── Audit ───────────────────────────────────────────────────────────────────
+
+func (h *Handler) ListAuditRuns(w http.ResponseWriter, r *http.Request) {
+	runs, err := h.store.ListAuditRuns()
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if runs == nil {
+		runs = []models.AuditRunSummary{}
+	}
+	jsonOK(w, runs)
+}
+
+func (h *Handler) GetAuditRun(w http.ResponseWriter, r *http.Request) {
+	runID := chi.URLParam(r, "runID")
+	records, err := h.store.GetAuditRun(runID)
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if records == nil {
+		records = []*models.AuditRecord{}
+	}
+	jsonOK(w, records)
+}
+
 func (h *Handler) readProfile() string {
 	data, err := os.ReadFile(h.profilePath)
 	if err != nil {
 		return ""
 	}
 	return string(data)
+}
+
+// isSeniorTitle returns true when the job title clearly indicates a seniority
+// level that is beyond the candidate's target (Senior, Lead, Principal, etc.).
+// These jobs are dropped before dedup and never enter the pipeline.
+var seniorTitleRe = regexp.MustCompile(
+	`(?i)\b(senior|sr\.?|lead|principal|staff\s+engineer|head\s+of|leidinggevende)\b`,
+)
+
+var studentTitleRe = regexp.MustCompile(
+	`(?i)\b(thesis\s+student|student\s+thesis|thesis\s+worker|bachelorproef|masterproef|eindwerk|internship|stageopdracht|stagiair)\b`,
+)
+
+func isSeniorTitle(title string) bool {
+	return seniorTitleRe.MatchString(title) || studentTitleRe.MatchString(title)
+}
+
+// isTeachingRole returns true when the job title is an IT/ICT teaching position.
+// Both a teaching keyword AND an IT/tech subject keyword must be present.
+// These jobs score low in the pre-filter (no tech stack in title) so we
+// guarantee them a slot regardless of the competitive score cut-off.
+var teachingWordRe = regexp.MustCompile(
+	`(?i)\b(docent|leerkracht|lesgever|lector|leraar|instructeur|lecturer|teacher|trainer)\b`,
+)
+var itSubjectRe = regexp.MustCompile(
+	`(?i)\b(ict|informatica|coding|cybersecurity|software|digitaal|digital|` +
+		`computer|netwerk|network|web|cloud|devops|security)\b` +
+		`|\bprogramm` + // matches programmeren, programmeur, programmeer etc.
+		`|\bdata\s+(engineer|science|analyst|platform)` + // data in IT context only
+		`|\b(it|ai)\s+(teacher|docent|trainer|lecturer|lesgever)` + // "IT teacher" etc.
+		`|\b(docent|leerkracht|lesgever|trainer|lecturer)\s+(it|ai|ict)\b`, // "docent IT" etc.
+)
+
+func isTeachingRole(title string) bool {
+	return teachingWordRe.MatchString(title) && itSubjectRe.MatchString(title)
 }
 
 func jsonOK(w http.ResponseWriter, v any) {

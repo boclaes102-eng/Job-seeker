@@ -31,5 +31,8 @@ func NewRouter(h *Handler) http.Handler {
 	r.Get("/api/profile", h.GetProfile)
 	r.Put("/api/profile", h.SaveProfile)
 
+	r.Get("/api/audit/runs", h.ListAuditRuns)
+	r.Get("/api/audit/runs/{runID}", h.GetAuditRun)
+
 	return r
 }

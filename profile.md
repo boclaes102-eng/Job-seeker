@@ -10,7 +10,7 @@ Currently completing a Cybersecurity Analyst & Engineer programme at Syntra alon
 
 - Based in: Langdorp, Belgium
 - Background: web development, IoT, embedded systems, offensive security, machine learning
-- Open to roles in: full-stack development, data engineering, cybersecurity, AI/ML engineering
+- Open to roles in: full-stack development, data engineering, cybersecurity, AI/ML engineering, IT/ICT teaching
 - Languages: Dutch (native), English (professional)
 
 ## Experience
@@ -88,6 +88,7 @@ Roles that fit well:
 - **Security-focused developer / DevSecOps** — building security tooling, integrating SIEM pipelines, writing scanners, or hardening production systems; hands-on pentest experience and know how attacks work at the code level
 - **IoT / embedded + software hybrid** — firmware AND cloud backend AND dashboard; exactly what I did at Agilica and MyPitch
 - **AI / ML engineer** — agentic tools, LLM integration, data pipelines, predictive models; shipped a Claude-powered agentic CLI and an XGBoost churn predictor with live Streamlit UI
+- **IT/ICT teacher or lecturer** — programming, web development, IoT, and cybersecurity for secondary schools, colleges, or training centres; taught a full bachelor-level curriculum at Karel de Grote Hogeschool, mentored project teams, genuinely enjoy explaining technical concepts
 
 What I care about:
 - Code review actually happens
@@ -132,3 +133,7 @@ queries:
 - API developer
 - Go developer
 - Fastify developer
+- IT teacher
+- ICT teacher
+- programming teacher
+- lecturer IT

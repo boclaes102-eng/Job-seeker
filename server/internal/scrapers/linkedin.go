@@ -68,7 +68,36 @@ var belgianIndicators = []string{
 	"oostende", "ostend",
 }
 
-func isBelgian(location string) bool {
+// nonBelgianCities is checked against the job title as well as the location.
+// LinkedIn occasionally misidentifies a location (e.g. extracting a word from
+// the title as a city name), so a foreign city in the title is a hard reject.
+var nonBelgianCities = []string{
+	// Germany
+	"stuttgart", "münchen", "munich", "berlin", "hamburg", "frankfurt",
+	"düsseldorf", "dusseldorf", "köln", "cologne", "dortmund", "dresden",
+	// Netherlands
+	"amsterdam", "rotterdam", "den haag", "eindhoven", "utrecht", "tilburg",
+	// France
+	"paris", "lyon", "marseille", "toulouse", "bordeaux", "lille",
+	// UK
+	"london", "manchester", "birmingham", "edinburgh",
+	// Other
+	"vienna", "wien", "zürich", "zurich", "madrid", "barcelona",
+}
+
+// isBelgian returns true if the job should be kept as a Belgian posting.
+// It checks both location and title — LinkedIn sometimes misparses a word
+// from the title as a city name, producing a false-Belgian location string.
+func isBelgian(location, title string) bool {
+	combined := strings.ToLower(location + " " + title)
+
+	// Hard reject: explicit non-Belgian city in title or location overrides everything.
+	for _, nb := range nonBelgianCities {
+		if strings.Contains(combined, nb) {
+			return false
+		}
+	}
+
 	if location == "" {
 		return true
 	}
@@ -330,7 +359,7 @@ func parseSearchPageHTML(body []byte) ([]*models.Job, error) {
 func (s *LinkedInScraper) filterAndCap(jobs []*models.Job) []*models.Job {
 	var out []*models.Job
 	for _, j := range jobs {
-		if isBelgian(j.Location) {
+		if isBelgian(j.Location, j.Title) {
 			out = append(out, j)
 			if len(out) >= maxJobsPerQuery {
 				break

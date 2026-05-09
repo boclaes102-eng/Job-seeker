@@ -55,6 +55,31 @@ func (s *Store) migrate() error {
 	// Indexes that speed up the common queries.
 	_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_jobs_status_score ON jobs(status, match_score DESC)`)
 	_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_jobs_source ON jobs(source)`)
+
+	// Audit table: every job seen in every scrape run, kept or dropped.
+	if _, err := s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS scrape_audit (
+			id           TEXT NOT NULL,
+			run_id       TEXT NOT NULL,
+			url          TEXT NOT NULL,
+			title        TEXT NOT NULL,
+			company      TEXT NOT NULL,
+			location     TEXT NOT NULL,
+			source       TEXT NOT NULL,
+			posted_at    DATETIME,
+			det_score    INTEGER NOT NULL DEFAULT 0,
+			matched_tech TEXT NOT NULL DEFAULT '[]',
+			missing_tech TEXT NOT NULL DEFAULT '[]',
+			was_kept     INTEGER NOT NULL DEFAULT 0,
+			used_llm     INTEGER NOT NULL DEFAULT 0,
+			final_score  INTEGER NOT NULL DEFAULT 0,
+			reason       TEXT NOT NULL DEFAULT '',
+			scraped_at   DATETIME NOT NULL,
+			PRIMARY KEY (id, run_id)
+		)`); err != nil {
+		return err
+	}
+	_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_audit_run ON scrape_audit(run_id, det_score DESC)`)
 	return nil
 }
 
@@ -211,6 +236,117 @@ func (s *Store) Get(id string) (*models.Job, error) {
 
 func (s *Store) Close() error {
 	return s.db.Close()
+}
+
+// ─── Audit ────────────────────────────────────────────────────────────────────
+
+// BulkInsertAudit writes one record per scraped job for this run.
+// Called immediately after the pre-filter so all jobs (kept + dropped) are stored.
+func (s *Store) BulkInsertAudit(records []*models.AuditRecord) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	stmt, err := tx.Prepare(`
+		INSERT OR REPLACE INTO scrape_audit
+			(id, run_id, url, title, company, location, source, posted_at,
+			 det_score, matched_tech, missing_tech, was_kept, final_score, scraped_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for _, r := range records {
+		tech, _ := encodeTech(r.MatchedTech)
+		missing, _ := encodeTech(r.MissingTech)
+		wasKept := 0
+		if r.WasKept {
+			wasKept = 1
+		}
+		if _, err := stmt.Exec(
+			r.ID, r.RunID, r.URL, r.Title, r.Company, r.Location, r.Source,
+			r.PostedAt.Format(time.RFC3339),
+			r.DetScore, tech, missing, wasKept,
+			r.DetScore, // final_score starts equal to det_score
+			r.ScrapedAt.Format(time.RFC3339),
+		); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// UpdateAuditFinal sets the LLM-refined score and reason for one kept job.
+func (s *Store) UpdateAuditFinal(id, runID string, finalScore int, reason string, usedLLM bool) error {
+	used := 0
+	if usedLLM {
+		used = 1
+	}
+	_, err := s.db.Exec(
+		`UPDATE scrape_audit SET final_score=?, reason=?, used_llm=? WHERE id=? AND run_id=?`,
+		finalScore, reason, used, id, runID,
+	)
+	return err
+}
+
+// ListAuditRuns returns a summary of the last 20 scrape runs, newest first.
+func (s *Store) ListAuditRuns() ([]models.AuditRunSummary, error) {
+	rows, err := s.db.Query(`
+		SELECT run_id, COUNT(*) AS total, SUM(was_kept) AS kept, MIN(scraped_at) AS scraped_at
+		FROM scrape_audit
+		GROUP BY run_id
+		ORDER BY scraped_at DESC
+		LIMIT 20`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []models.AuditRunSummary
+	for rows.Next() {
+		var r models.AuditRunSummary
+		var ts string
+		if err := rows.Scan(&r.RunID, &r.Total, &r.Kept, &ts); err != nil {
+			return nil, err
+		}
+		r.ScrapedAt = parseTime(ts)
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// GetAuditRun returns all records for one run, sorted by det_score descending.
+func (s *Store) GetAuditRun(runID string) ([]*models.AuditRecord, error) {
+	rows, err := s.db.Query(`
+		SELECT id, run_id, url, title, company, location, source, posted_at,
+		       det_score, matched_tech, missing_tech, was_kept, used_llm, final_score, reason, scraped_at
+		FROM scrape_audit
+		WHERE run_id = ?
+		ORDER BY det_score DESC`, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*models.AuditRecord
+	for rows.Next() {
+		r := &models.AuditRecord{}
+		var postedAt, scrapedAt, tech, missing string
+		var wasKept, usedLLM int
+		if err := rows.Scan(
+			&r.ID, &r.RunID, &r.URL, &r.Title, &r.Company, &r.Location, &r.Source, &postedAt,
+			&r.DetScore, &tech, &missing, &wasKept, &usedLLM, &r.FinalScore, &r.Reason, &scrapedAt,
+		); err != nil {
+			return nil, err
+		}
+		r.PostedAt = parseTime(postedAt)
+		r.ScrapedAt = parseTime(scrapedAt)
+		r.MatchedTech = decodeTech(tech)
+		r.MissingTech = decodeTech(missing)
+		r.WasKept = wasKept == 1
+		r.UsedLLM = usedLLM == 1
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }
 
 func encodeTech(t []string) (string, error) {
