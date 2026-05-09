@@ -274,63 +274,82 @@ func (m *Matcher) DraftEmail(ctx context.Context, job *models.Job, profile strin
 	idx := BuildCandidateIndex(profile)
 	score := DeterministicScore(job, idx)
 
-	// Pick the experience entry most relevant to this job.
-	bestExp := pickBestExperience(profile, job.Title+" "+job.Description)
+	jobText := job.Title + " " + job.Description
 
-	// Ask the LLM for ONE sentence only: how the matched tech connects to this role.
-	// Keeping the ask tiny reduces hallucination to near-zero.
-	fitSentence, err := m.generateFitSentence(ctx, job.Title, job.Company, score.MatchedTech)
-	if err != nil {
-		// Fall back to a safe generic sentence — don't fail the whole email.
-		fitSentence = fmt.Sprintf("My background in %s aligns directly with the requirements listed for this role.",
-			joinTech(score.MatchedTech, 3))
-	}
+	// Pick the most relevant project and experience using matched tech as the signal.
+	bestProj := pickBestProject(profile, score.MatchedTech, jobText)
+	bestExp := pickBestExperience(profile, score.MatchedTech, jobText)
 
 	subject := fmt.Sprintf("Application: %s — Bo Claes", job.Title)
-	body := buildEmailBody(job.Title, job.Company, fitSentence, bestExp)
+	body := buildEmailBody(job.Title, job.Company, bestProj, bestExp)
 	return EmailDraft{Subject: subject, Body: body}, nil
 }
 
-// generateFitSentence asks the LLM for a single sentence explaining the tech match.
-// The prompt is so constrained that hallucination is nearly impossible.
-func (m *Matcher) generateFitSentence(ctx context.Context, title, company string, matchedTech []string) (string, error) {
-	if len(matchedTech) == 0 {
-		return "", fmt.Errorf("no matched tech")
-	}
-	tech := joinTech(matchedTech, 4)
-	prompt := fmt.Sprintf(
-		`Write exactly ONE sentence (max 25 words) explaining how experience with %s is relevant to a %s role at %s. Use only these technologies — do not mention any others. Return plain text, no quotes.`,
-		tech, title, company,
-	)
-	req := ollamaRequest{
-		Model:    m.model,
-		Messages: []ollamaMessage{{Role: "user", Content: prompt}},
-		Stream:   false,
-		Options:  ollamaOptions{Temperature: 0.3, NumPredict: 60},
-	}
-	var resp ollamaResponse
-	if err := m.callOllama(ctx, "/api/chat", req, &resp); err != nil {
-		return "", err
-	}
-	s := strings.TrimSpace(resp.Message.Content)
-	s = strings.Trim(s, `"`)
-	if s == "" {
-		return "", fmt.Errorf("empty response")
-	}
-	return s, nil
-}
-
-// pickBestExperience returns the experience entry whose text overlaps most with
-// the job's combined title+description. Falls back to the first entry.
-func pickBestExperience(profile, jobText string) string {
+// pickBestExperience returns the experience entry that mentions the most matched techs.
+func pickBestExperience(profile string, matchedTech []string, jobText string) string {
 	expSection := sectionContent(profile, "Experience")
 	if expSection == "" {
 		return ""
 	}
-	// Split into individual bullet entries on lines starting with "- **"
+	entries := splitBulletEntries(expSection)
+	if len(entries) == 0 {
+		return strings.TrimSpace(expSection)
+	}
+	best, _ := scoredBest(entries, matchedTech, jobText)
+	best = strings.TrimPrefix(strings.TrimSpace(best), "- ")
+	best = strings.ReplaceAll(best, "**", "")
+	return best
+}
+
+// pickBestProject returns the project entry that mentions the most matched techs,
+// formatted for an email. Returns empty string if no project has at least one match.
+func pickBestProject(profile string, matchedTech []string, jobText string) string {
+	projSection := sectionContent(profile, "Projects")
+	if projSection == "" {
+		return ""
+	}
+	entries := splitH3Entries(projSection)
+	if len(entries) == 0 {
+		return ""
+	}
+	best, techScore := scoredBest(entries, matchedTech, jobText)
+	if techScore < 1 {
+		return ""
+	}
+	return formatProjectEntry(best)
+}
+
+// scoredBest picks the entry with the most matched-tech hits, using word overlap as tiebreak.
+func scoredBest(entries []string, matchedTech []string, jobText string) (string, int) {
+	jobWords := wordSet(strings.ToLower(jobText))
+	best := entries[0]
+	bestTech, bestWord := -1, -1
+	for _, e := range entries {
+		lower := strings.ToLower(e)
+		tech := 0
+		for _, t := range matchedTech {
+			if strings.Contains(lower, strings.ToLower(t)) {
+				tech++
+			}
+		}
+		word := 0
+		for w := range wordSet(lower) {
+			if len(w) > 4 && jobWords[w] {
+				word++
+			}
+		}
+		if tech > bestTech || (tech == bestTech && word > bestWord) {
+			best, bestTech, bestWord = e, tech, word
+		}
+	}
+	return best, bestTech
+}
+
+// splitBulletEntries splits an Experience section on "- **" bullet lines.
+func splitBulletEntries(section string) []string {
 	var entries []string
 	current := ""
-	for _, line := range strings.Split(expSection, "\n") {
+	for _, line := range strings.Split(section, "\n") {
 		if strings.HasPrefix(strings.TrimSpace(line), "- **") && current != "" {
 			entries = append(entries, strings.TrimSpace(current))
 			current = line
@@ -345,50 +364,90 @@ func pickBestExperience(profile, jobText string) string {
 	if current != "" {
 		entries = append(entries, strings.TrimSpace(current))
 	}
-	if len(entries) == 0 {
-		return strings.TrimSpace(expSection)
-	}
-
-	jobWords := wordSet(strings.ToLower(jobText))
-	best, bestScore := entries[0], -1
-	for _, e := range entries {
-		score := 0
-		for w := range wordSet(strings.ToLower(e)) {
-			if len(w) > 3 && jobWords[w] {
-				score++
-			}
-		}
-		if score > bestScore {
-			bestScore = score
-			best = e
-		}
-	}
-	// Strip the leading "- " bullet marker and markdown bold markers (**text**).
-	best = strings.TrimPrefix(strings.TrimSpace(best), "- ")
-	best = strings.ReplaceAll(best, "**", "")
-	return best
+	return entries
 }
 
-func buildEmailBody(title, company, fitSentence, bestExp string) string {
+// splitH3Entries splits a Projects section on "### " heading lines.
+func splitH3Entries(section string) []string {
+	var entries []string
+	current := ""
+	for _, line := range strings.Split(section, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "### ") {
+			if current != "" {
+				entries = append(entries, strings.TrimSpace(current))
+			}
+			current = line
+		} else if current != "" {
+			current += "\n" + line
+		}
+	}
+	if current != "" {
+		entries = append(entries, strings.TrimSpace(current))
+	}
+	return entries
+}
+
+// formatProjectEntry converts a ### Project block into a compact email-ready string.
+func formatProjectEntry(entry string) string {
+	lines := strings.Split(strings.TrimSpace(entry), "\n")
+	if len(lines) == 0 {
+		return entry
+	}
+	name := strings.TrimPrefix(strings.TrimSpace(lines[0]), "### ")
+	var desc, stack string
+	for _, l := range lines[1:] {
+		l = strings.TrimSpace(l)
+		if l == "" {
+			continue
+		}
+		if strings.HasPrefix(l, "Stack:") {
+			stack = l
+			continue
+		}
+		if desc == "" {
+			if i := strings.IndexByte(l, '.'); i > 0 {
+				desc = l[:i+1]
+			} else if i := strings.IndexByte(l, ';'); i > 0 {
+				desc = l[:i]
+			} else if len(l) > 120 {
+				desc = l[:120] + "..."
+			} else {
+				desc = l
+			}
+		}
+	}
+	result := name + " (personal project)"
+	if desc != "" {
+		result += " — " + desc
+	}
+	if stack != "" {
+		result += "\n  " + stack
+	}
+	return result
+}
+
+func buildEmailBody(title, company, bestProj, bestExp string) string {
 	var b strings.Builder
 	b.WriteString("Dear Hiring Manager,\n\n")
 
-	// Paragraph 1: intro + how the role was found
-	fmt.Fprintf(&b, "I am writing to apply for the %s position at %s. I came across this role via a personal job-scouting tool I built — a Go backend that scrapes job boards and scores postings with a local LLM to surface best matches.\n\n", title, company)
+	fmt.Fprintf(&b, "I came across the %s role at %s through a personal job-scouting tool I built — a Go backend that scrapes job boards and scores postings against my profile using a local LLM.\n\n", title, company)
 
-	// Paragraph 2: skill fit (LLM-generated single sentence)
-	b.WriteString(fitSentence)
-	b.WriteString("\n\n")
-
-	// Paragraph 3: most relevant experience entry (verbatim from profile — no hallucination)
-	if bestExp != "" {
+	// Most relevant project first (direct tech evidence).
+	if bestProj != "" {
+		b.WriteString("I think I'm a strong fit — here's what's most relevant:\n\n")
+		b.WriteString(bestProj)
+		b.WriteString("\n\n")
+		if bestExp != "" {
+			b.WriteString(bestExp)
+			b.WriteString("\n\n")
+		}
+	} else if bestExp != "" {
+		b.WriteString("I think I'm a strong fit — here's what's most relevant:\n\n")
 		b.WriteString(bestExp)
 		b.WriteString("\n\n")
 	}
 
-	// Paragraph 4: call to action
-	b.WriteString("I would welcome the opportunity to discuss how my background fits your needs.\n\n")
-
+	b.WriteString("My CV and project portfolio are attached.\n\n")
 	b.WriteString("Bo Claes | boclaes102@gmail.com | github.com/boclaes102-eng")
 	return b.String()
 }

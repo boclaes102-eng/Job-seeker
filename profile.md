@@ -31,41 +31,46 @@ Currently completing a Cybersecurity Analyst & Engineer programme at Syntra alon
 ## Projects
 
 ### Three-platform cybersecurity ecosystem
-CyberOps Dashboard (Next.js · Vercel) → Threat Intel Platform (Fastify · PostgreSQL · BullMQ · Redis · Railway) → CyberSuite Pro Desktop (Python · CustomTkinter · Windows). Recon results flow from the browser dashboard through a server-side proxy into a shared PostgreSQL backend and load into the desktop attack tool with one click.
+Three interconnected tools built as one end-to-end workflow: CyberOps Dashboard (Next.js · Vercel) feeds recon data through a shared PostgreSQL backend (Fastify · Redis · Railway) and into CyberSuite Pro desktop (Python · Windows) — a single click moves results from browser to pentesting toolkit.
 
 ### CyberOps Dashboard
-56 integrated security tools — Next.js 15, TypeScript strict, Vercel. All algorithms from scratch: Wagner-Fischer edit distance, MurmurHash3, CVSS v3.1 base score, sliding-window rate limiter at Vercel Edge. Zero any-escapes in strict TypeScript; all API keys server-side.
+56 integrated security tools across OSINT, recon, threat intel, web analysis, forensics, and SIEM — built on Next.js 15 with zero third-party UI libraries; all core algorithms hand-rolled from scratch: Wagner-Fischer edit distance, MurmurHash3, CVSS v3.1 base score, and a sliding-window rate limiter running at Vercel Edge. All API credentials isolated server-side; zero any-escapes in strict TypeScript.
+Stack: Next.js 15 · TypeScript (strict) · Tailwind CSS · Vercel · PostgreSQL
 
 ### Threat Intel Platform
-Production Fastify API — PostgreSQL 16, Redis 7, three BullMQ workers: CVE feed (NIST NVD), IOC enrichment (AbuseIPDB + VirusTotal + AlienVault OTX in parallel), asset-scan (CPE→CVE correlation). Docker multi-target builds, full CI pipeline with real Postgres/Redis containers.
-Stack: Fastify · TypeScript · PostgreSQL · Redis · BullMQ · Drizzle ORM · Docker · Railway · Vitest
+Production backend API powering the three-platform ecosystem — multi-source IOC enrichment (AbuseIPDB + VirusTotal + AlienVault OTX in parallel with Redis caching), NVD CVE feed sync with exponential backoff, CPE→CVE asset correlation, SIEM event ingestion with 7 detection rules, JWT auth, and a Prometheus metrics endpoint. Three BullMQ workers run continuously on Railway; full CI pipeline tests against real Postgres and Redis containers.
+Stack: Fastify · TypeScript · PostgreSQL 16 · Redis 7 · BullMQ · Drizzle ORM · Docker · Railway · Vitest
 
 ### CyberSuite Pro
-15-module penetration testing toolkit — network discovery, MITM, SSL intercept, Metasploit bridge, AD enumeration via pure-Python LDAP, YARA + MITRE ATT&CK malware analysis, reporting. 147 pytest tests, ships as single-file .exe.
+15-module desktop penetration testing toolkit — modules include Network Map (ARP/nmap/SNMP), NIDS with 6 detection algorithms, MITM/ARP Spoofing, SSL Interceptor (mitmproxy), AD Enumeration via pure-Python LDAP, Metasploit Bridge, Static Malware Analyzer (Shannon entropy + YARA + 18 MITRE ATT&CK API mappings), and a full Report Generator. Thread-safe I/O with threading.local(), UAC auto-elevation on startup, 147 pytest tests; ships as a single-file Windows .exe.
 Stack: Python · CustomTkinter · Scapy · Nmap · mitmproxy · ldap3 · YARA · MITRE ATT&CK · PyInstaller
 
 ### The Deep Space Project
-Fully interactive 3D portfolio — thedeepspaceproject.be. Three.js space scene with multiplayer Pong (Supabase Realtime, authoritative physics + lerp interpolation), procedural jukebox, browser-side SIEM. Zero npm dependencies shipped to browser.
-Stack: Three.js · Vanilla JS · Supabase · Web Audio API · GSAP · Groq AI · GLSL
+Zero-dependency interactive 3D portfolio at thedeepspaceproject.be — five fully built apps inside a Three.js space scene: a retro PC with 10 security tools, a live TV (Hacker News · crypto · weather), an arcade cabinet with Pong/Galaga/Breakout plus multiplayer Pong (Supabase Realtime, authoritative physics + lerp interpolation), a procedurally synthesised jukebox, and a phone booth. A browser-side SIEM monitors for XSS, SQLi, prototype pollution, path probes, and credential attacks in real time. Zero npm dependencies shipped to browser.
+Stack: Three.js · Vanilla JS · Supabase · Groq AI · GSAP · GLSL · Web Audio API
 
 ### Real-Time Data Pipeline
-3 async producers (stocks, crypto, Reddit sentiment) → Kafka-compatible async broker → SQLite → WebSocket fan-out → live Chart.js dashboard. Swapping in Confluent Kafka = one file change.
-Stack: Python · FastAPI · asyncio · WebSockets · SQLite · Chart.js
+Three-tier streaming pipeline: three concurrent async producers (stocks via yfinance, crypto via CoinGecko, Reddit sentiment via PRAW) push into an asyncio.Queue acting as a Kafka-compatible in-process broker, which a consumer drains to aiosqlite and broadcasts via WebSocket fan-out to a live Chart.js dashboard. REST endpoints expose historical snapshots and throughput metrics; migrating to Confluent Kafka requires changing one file.
+Stack: Python · FastAPI · asyncio · WebSockets · aiosqlite · Chart.js
+
+### Network Intrusion Detection System
+Production-grade Python NIDS with six statistical detection modules: Port Scan (T1046, sliding 60-second windows), SYN Flood (Welford online baselines), DNS Tunneling (Shannon entropy + label length + query rates), ARP Poisoning (MAC binding conflict detection), ICMP Amplification (Smurf + reflection), and 4σ Statistical Baseline Anomaly. Async Scapy packet capture, Rich terminal dashboard, ECS-aligned NDJSON output for SIEM ingestion.
+Stack: Python · Scapy · asyncio · Rich · NDJSON (ECS)
 
 ### Telecom Churn Predictor
-XGBoost classifier — ROC-AUC 0.84, 79.7% accuracy. IBM Telco dataset, 7,043 customers, 20 features. Live Streamlit UI with probability gauge, risk verdict, churn driver bullets, feature importances.
+XGBoost classifier trained on the IBM Telco dataset — ROC-AUC 0.84, 79.7% accuracy across 7,043 customers and 20 features. Live Streamlit UI outputs a churn probability gauge, risk verdict, retention recommendations, key churn driver bullets, and full feature importance rankings.
 Stack: XGBoost · Streamlit · scikit-learn · pandas
 
 ### PyMind — AI Python Assistant
-Agentic CLI powered by Claude Sonnet with tool use and prompt caching. Reads codebases, searches code, runs Python snippets; agentic loop chains multiple tool calls until complete.
+Agentic CLI powered by Claude Sonnet with tool use and prompt caching — reads entire codebases, searches code with grep/glob, executes Python snippets, and chains multiple tool calls in an autonomous loop until the task is complete. Built on the Anthropic API with persistent prompt caching to keep costs low on long sessions.
 Stack: Python · Anthropic Claude API · Tool use · Prompt caching
 
 ### Job Scout
-Full-stack job scouting tool — Go backend scrapes job boards concurrently using goroutines, scores with local Ollama LLM, stores in SQLite; React + TypeScript frontend.
-Stack: Go · chi · SQLite · Ollama · React · TypeScript · Vite · Tailwind
+Full-stack job scouting tool built to automate my own job search — Go backend scrapes LinkedIn and Adzuna concurrently with goroutines, runs a two-stage scoring pipeline (deterministic keyword match + Ollama LLM referee), and surfaces ranked results in a React + TypeScript dashboard. SQLite audit trail logs every scoring decision.
+Stack: Go · chi · SQLite · Ollama · React · TypeScript · Vite · Tailwind CSS
 
 ### Sub-Checker
-Scans 2 years of Gmail to detect recurring subscriptions. Fully local — nothing leaves the machine.
+Scans 2 years of Gmail to surface recurring subscriptions — fully local, nothing leaves the machine; reads email headers via the Gmail API with OAuth2, groups by sender pattern, and outputs a sorted cost summary.
 Stack: Python · Gmail API · OAuth2
 
 ## Tech stack

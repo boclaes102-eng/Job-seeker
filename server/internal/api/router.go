@@ -2,6 +2,9 @@ package api
 
 import (
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -34,5 +37,36 @@ func NewRouter(h *Handler) http.Handler {
 	r.Get("/api/audit/runs", h.ListAuditRuns)
 	r.Get("/api/audit/runs/{runID}", h.GetAuditRun)
 
+	// Serve the React frontend from client/dist (two levels up from server/cmd/server)
+	distDir := resolveDist()
+	if _, err := os.Stat(distDir); err == nil {
+		fs := http.FileServer(http.Dir(distDir))
+		r.Get("/*", func(w http.ResponseWriter, req *http.Request) {
+			// If the file exists in dist, serve it; otherwise fall back to index.html (SPA)
+			path := filepath.Join(distDir, filepath.Clean(strings.TrimPrefix(req.URL.Path, "/")))
+			if _, err := os.Stat(path); os.IsNotExist(err) {
+				http.ServeFile(w, req, filepath.Join(distDir, "index.html"))
+				return
+			}
+			fs.ServeHTTP(w, req)
+		})
+	}
+
 	return r
+}
+
+// resolveDist finds client/dist relative to the binary's working directory.
+func resolveDist() string {
+	// go run ./cmd/server runs with cwd = server/
+	candidates := []string{
+		"../client/dist",
+		"../../client/dist",
+	}
+	for _, p := range candidates {
+		if _, err := os.Stat(p); err == nil {
+			abs, _ := filepath.Abs(p)
+			return abs
+		}
+	}
+	return "../client/dist"
 }
