@@ -208,3 +208,26 @@ def test_new_since_last_visit(client):
     assert [j["external_id"] for j in fresh] == ["after-seen"]
     client.post("/api/seen")
     assert client.get("/api/status").json()["counts"]["unseen"] == 0
+
+
+def test_left_out_counts_name_each_language(client):
+    def counts():
+        return client.get("/api/status").json()["counts"]
+    db.upsert_job({"source": "ictjob", "external_id": "nl-1", "title": "Security engineer", "company": "NL Co",
+                   "description": "Wij zoeken een security engineer voor ons team. Je hebt ervaring met netwerken "
+                                  "en je werkt graag samen met collega's in een dynamische omgeving."})
+    db.upsert_job({"source": "ictjob", "external_id": "fr-1", "title": "Ingénieur sécurité", "company": "FR Co",
+                   "description": "Nous recherchons un ingénieur sécurité pour notre équipe. Vous avez une "
+                                  "expérience en réponse aux incidents et une bonne connaissance des réseaux."})
+    try:
+        client.put("/api/settings", json={"job_languages": ["nl"]})
+        c = counts()
+        assert c["languages"] == ["nl"]
+        left = c["left_out"]["other_languages"]
+        assert left.get("en", 0) >= 1 and left.get("fr", 0) >= 1 and "nl" not in left
+        assert sum(left.values()) + c["left_out"]["french_required"] == c["language_filtered"]
+    finally:
+        client.put("/api/settings", json={"job_languages": ["en", "nl"]})
+    c = counts()
+    assert c["languages"] == ["en", "nl"]
+    assert "en" not in c["left_out"]["other_languages"]

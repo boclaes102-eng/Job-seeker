@@ -161,6 +161,26 @@ function renderPipeline(counts) {
        ${label}<span class="n">${n}</span></button>`).join("");
 }
 
+const LANGUAGE_NAMES = { en: "English", nl: "Dutch", fr: "French" };
+const andList = (items) => items.length < 2 ? items.join("") : `${items.slice(0, -1).join(", ")} and ${items.at(-1)}`;
+
+// "Out of 204 Dutch jobs. 198 English and 77 French jobs were left out, and 12 jobs that ask for French."
+function languageSummary(c) {
+  const chosen = andList((c.languages || []).map((l) => LANGUAGE_NAMES[l] || l));
+  let text = `Out of ${c.total} ${chosen ? `${chosen} ` : ""}jobs.`;
+  const others = Object.entries(c.left_out?.other_languages || {})
+    .sort((a, b) => b[1] - a[1])
+    .map(([l, n]) => `${n} ${LANGUAGE_NAMES[l] || l}`);
+  const french = c.left_out?.french_required || 0;
+  const frenchText = `${french} ${french === 1 ? "job that asks" : "jobs that ask"} for French`;
+  if (others.length) {
+    text += ` ${andList(others)} jobs were left out${french ? `, and ${frenchText}` : ""}.`;
+  } else if (french) {
+    text += ` ${frenchText[0].toUpperCase()}${frenchText.slice(1)} ${french === 1 ? "was" : "were"} left out.`;
+  }
+  return text;
+}
+
 async function refreshStatus() {
   appStatus = await api("/api/status");
   const s = appStatus;
@@ -169,7 +189,7 @@ async function refreshStatus() {
     .join("");
   $("#counts").innerHTML = s.counts.total
     ? `<span class="num">${s.counts.good}</span> jobs fit your CV well, <span class="num">${s.counts.strong}</span> of them strongly.
-       <span class="sub">Out of ${s.counts.total} English and Dutch jobs${s.counts.language_filtered ? `. ${s.counts.language_filtered} French jobs were left out` : ""}.</span>`
+       <span class="sub">${esc(languageSummary(s.counts))}</span>`
     : `No jobs yet. <span class="sub">Search now looks through ictjob.be, Jooble and Le Forem and scores every job against your CV.</span>`;
   renderPipeline(s.counts);
   renderNewLine();

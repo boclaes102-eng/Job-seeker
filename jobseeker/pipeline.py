@@ -73,7 +73,7 @@ def run_search() -> dict[str, Any]:
     counts = db.job_counts()
     _set(phase="done", message=(
         f"Done: {len(new_ids)} new jobs. {counts['good']} good matches (65+), "
-        f"{counts['language_filtered']} French jobs filtered out."
+        f"{counts['language_filtered']} left out by your language settings."
     ))
     return dict(STATUS)
 
