@@ -77,6 +77,12 @@ function applyLabel(job) {
   try { return `Apply on ${new URL(job.url).hostname.replace(/^www\./, "")}`; } catch (_) { return "Open posting"; }
 }
 
+// A web search for the same vacancy, for when the job site itself is down or slow
+function searchElsewhereUrl(job) {
+  const title = job.title.replace(/\s*\((?:[mhfvx]\s*\/\s*){1,3}[mhfvx]\)\s*/gi, " ").trim();  // drop "(m/f/x)"
+  return `https://www.google.com/search?q=${encodeURIComponent(`"${title}" ${job.company || ""} job`.trim())}`;
+}
+
 const isNewToYou = (j) => Boolean(appStatus?.seen_until && j.fetched_at > appStatus.seen_until);
 
 function ago(iso) {
@@ -508,9 +514,11 @@ async function openJob(id) {
         ? `<p class="hint">The text from the job site names no specific skills. Paste the full posting below for a better score.</p>` : ""}
     </div>` : ""}
 
-    ${job.url ? `<div class="actions">
-      <a class="btn primary" href="${esc(job.url)}" target="_blank" rel="noopener">${esc(applyLabel(job))}</a>
-    </div>` : ""}
+    <div class="actions">
+      ${job.url ? `<a class="btn primary" href="${esc(job.url)}" target="_blank" rel="noopener">${esc(applyLabel(job))}</a>` : ""}
+      <a class="btn" href="${esc(searchElsewhereUrl(job))}" target="_blank" rel="noopener">Search for this job</a>
+    </div>
+    <p class="hint">If the job site does not load, search for the same vacancy on the company's own site or another job board.</p>
 
     <h3 class="sec">Your application <span class="hint" id="trackSaved" aria-live="polite"></span></h3>
     <div class="tracking">
