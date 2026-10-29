@@ -77,6 +77,12 @@ function applyLabel(job) {
   try { return `Apply on ${new URL(job.url).hostname.replace(/^www\./, "")}`; } catch (_) { return "Open posting"; }
 }
 
+// A web search for the same vacancy, for when the job site itself is down or slow
+function searchElsewhereUrl(job) {
+  const title = job.title.replace(/\s*\((?:[mhfvx]\s*\/\s*){1,3}[mhfvx]\)\s*/gi, " ").trim();  // drop "(m/f/x)"
+  return `https://www.google.com/search?q=${encodeURIComponent(`"${title}" ${job.company || ""} job`.trim())}`;
+}
+
 const isNewToYou = (j) => Boolean(appStatus?.seen_until && j.fetched_at > appStatus.seen_until);
 
 function ago(iso) {
@@ -155,6 +161,26 @@ function renderPipeline(counts) {
        ${label}<span class="n">${n}</span></button>`).join("");
 }
 
+const LANGUAGE_NAMES = { en: "English", nl: "Dutch", fr: "French" };
+const andList = (items) => items.length < 2 ? items.join("") : `${items.slice(0, -1).join(", ")} and ${items.at(-1)}`;
+
+// "Out of 204 Dutch jobs. 198 English and 77 French jobs were left out, and 12 jobs that ask for French."
+function languageSummary(c) {
+  const chosen = andList((c.languages || []).map((l) => LANGUAGE_NAMES[l] || l));
+  let text = `Out of ${c.total} ${chosen ? `${chosen} ` : ""}jobs.`;
+  const others = Object.entries(c.left_out?.other_languages || {})
+    .sort((a, b) => b[1] - a[1])
+    .map(([l, n]) => `${n} ${LANGUAGE_NAMES[l] || l}`);
+  const french = c.left_out?.french_required || 0;
+  const frenchText = `${french} ${french === 1 ? "job that asks" : "jobs that ask"} for French`;
+  if (others.length) {
+    text += ` ${andList(others)} jobs were left out${french ? `, and ${frenchText}` : ""}.`;
+  } else if (french) {
+    text += ` ${frenchText[0].toUpperCase()}${frenchText.slice(1)} ${french === 1 ? "was" : "were"} left out.`;
+  }
+  return text;
+}
+
 async function refreshStatus() {
   appStatus = await api("/api/status");
   const s = appStatus;
@@ -163,7 +189,7 @@ async function refreshStatus() {
     .join("");
   $("#counts").innerHTML = s.counts.total
     ? `<span class="num">${s.counts.good}</span> jobs fit your CV well, <span class="num">${s.counts.strong}</span> of them strongly.
-       <span class="sub">Out of ${s.counts.total} English and Dutch jobs${s.counts.language_filtered ? `. ${s.counts.language_filtered} French jobs were left out` : ""}.</span>`
+       <span class="sub">${esc(languageSummary(s.counts))}</span>`
     : `No jobs yet. <span class="sub">Search now looks through ictjob.be, Jooble and Le Forem and scores every job against your CV.</span>`;
   renderPipeline(s.counts);
   renderNewLine();
@@ -508,9 +534,13 @@ async function openJob(id) {
         ? `<p class="hint">The text from the job site names no specific skills. Paste the full posting below for a better score.</p>` : ""}
     </div>` : ""}
 
-    ${job.url ? `<div class="actions">
-      <a class="btn primary" href="${esc(job.url)}" target="_blank" rel="noopener">${esc(applyLabel(job))}</a>
-    </div>` : ""}
+    <div class="actions">
+      ${job.url ? `<a class="btn primary" href="${esc(job.url)}" target="_blank" rel="noopener">${esc(applyLabel(job))}</a>` : ""}
+      <a class="btn" href="${esc(searchElsewhereUrl(job))}" target="_blank" rel="noopener">Search for this job</a>
+    </div>
+    <p class="hint">${job.source === "ictjob"
+      ? `If the ictjob page keeps loading, open <a href="https://www.ictjob.be/en" target="_blank" rel="noopener">ictjob.be</a> first, then try again. Its bot protection only lets job pages load once your browser has visited the site.`
+      : "If the job site does not load, search for the same vacancy on the company's own site or another job board."}</p>
 
     <h3 class="sec">Your application <span class="hint" id="trackSaved" aria-live="polite"></span></h3>
     <div class="tracking">

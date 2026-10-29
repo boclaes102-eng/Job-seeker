@@ -343,14 +343,24 @@ def all_jobs() -> list[dict[str, Any]]:
     return [_row_to_job(r) for r in rows]
 
 
-def job_counts() -> dict[str, int]:
-    lang_sql, lang_params = language_clause()
+def job_counts() -> dict[str, Any]:
+    settings = get_settings()
+    lang_sql, lang_params = language_clause(settings)
+    wanted = lang_params  # the languages you chose, plus "unknown"
+    in_wanted = f"(language IS NULL OR language IN ({','.join('?' * len(wanted))}))"
     with connect() as conn:
         row = conn.execute(
             "SELECT COUNT(*), SUM(grade >= 65), SUM(grade >= 80) "
             f"FROM jobs WHERE status != 'hidden' AND {lang_sql}", lang_params,
         ).fetchone()
         filtered = conn.execute(f"SELECT COUNT(*) FROM jobs WHERE NOT ({lang_sql})", lang_params).fetchone()[0]
+        # Why jobs are left out: written in a language you did not choose, or asking for French
+        other_languages = dict(conn.execute(
+            f"SELECT language, COUNT(*) FROM jobs WHERE NOT {in_wanted} GROUP BY language", wanted,
+        ).fetchall())
+        french_required = conn.execute(
+            f"SELECT COUNT(*) FROM jobs WHERE {in_wanted} AND requires_french = 1", wanted,
+        ).fetchone()[0] if settings.get("hide_french_required", True) else 0
         by_status = dict(conn.execute(
             f"SELECT status, COUNT(*) FROM jobs WHERE {lang_sql} GROUP BY status", lang_params,
         ).fetchall())
@@ -360,6 +370,8 @@ def job_counts() -> dict[str, int]:
         ).fetchone()[0]
     return {"total": row[0] or 0, "good": row[1] or 0, "strong": row[2] or 0,
             "language_filtered": filtered or 0, "unseen": unseen or 0,
+            "languages": [lang for lang in wanted if lang != "unknown"],
+            "left_out": {"other_languages": other_languages, "french_required": french_required or 0},
             "by_status": {s: by_status.get(s, 0) for s in JOB_STATUSES}}
 
 
