@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Job Seeker</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;800&family=Schibsted+Grotesk:ital,wght@0,400;0,500;0,600;0,700;1,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="masthead">
+  <div class="masthead-inner">
+    <div class="wordmark" aria-label="Job Seeker">
+      <svg viewBox="0 0 40 14" aria-hidden="true"><rect x="0" y="0" width="16" height="14"/><rect x="18" y="0" width="12" height="14"/><rect x="32" y="4" width="3" height="10"/><rect x="37" y="7" width="3" height="7"/></svg>
+      Job Seeker
+    </div>
+    <nav class="nav" aria-label="Sections">
+      <button class="nav-link active" data-tab="jobs" id="navJobs" aria-current="page">Jobs</button>
+      <button class="nav-link" data-tab="settings" id="navSettings">Settings</button>
+    </nav>
+    <div class="masthead-right">
+      <div class="sources" id="pills" aria-label="Job sources"></div>
+      <button id="searchBtn" class="btn primary">Search now</button>
+    </div>
+  </div>
+  <div id="progress" class="runline" hidden>
+    <div class="runline-inner">
+      <span id="progressText"></span>
+      <div class="bar"><div class="bar-fill" id="progressFill"></div></div>
+    </div>
+  </div>
+</header>
+
+<main class="page">
+  <!-- JOBS -->
+  <section id="tab-jobs" class="tab-panel">
+    <h1 class="summary-line" id="counts"></h1>
+
+    <nav class="pipeline" id="pipeline" aria-label="Filter by status"></nav>
+
+    <div class="toolbar">
+      <div class="seg" role="group" aria-label="Minimum score" id="fGradeSeg">
+        <button data-min="" id="segAll">Any score</button>
+        <button data-min="45" id="seg45">45+</button>
+        <button data-min="65" id="seg65" class="on">65+</button>
+        <button data-min="80" id="seg80">80+</button>
+      </div>
+      <input id="fQuery" type="search" placeholder="Filter by title, company or town" aria-label="Filter by title, company or town">
+      <select id="fSource" aria-label="Source"><option value="">All sources</option></select>
+      <select id="fSort" aria-label="Sort">
+        <option value="grade">Best match first</option>
+        <option value="date">Newest first</option>
+      </select>
+    </div>
+
+    <div id="jobList" class="job-list"></div>
+  </section>
+
+  <!-- SETTINGS -->
+  <section id="tab-settings" class="tab-panel" hidden>
+    <div class="settings">
+      <form class="settings-form" id="settingsForm">
+        <h2>Search</h2>
+        <label for="sKeywords">Search keywords <span class="hint">One per line. Each one is searched on every source.</span></label>
+        <textarea id="sKeywords" rows="9"></textarea>
+
+        <div class="field-row">
+          <div>
+            <label for="sHome">Home towns <span class="hint">Comma separated</span></label>
+            <input id="sHome" type="text" placeholder="Langdorp, Antwerp">
+          </div>
+          <div>
+            <label for="sDistance">Max distance, km</label>
+            <input id="sDistance" type="number" min="5" max="300">
+          </div>
+        </div>
+        <div class="field-row">
+          <div>
+            <label for="sYears">Your years of experience</label>
+            <input id="sYears" type="number" min="0" max="40">
+          </div>
+          <div>
+            <label for="sAge">Max job age, days</label>
+            <input id="sAge" type="number" min="1" max="90">
+          </div>
+        </div>
+
+        <h2>Job languages</h2>
+        <div class="checks">
+          <label class="check"><input type="checkbox" data-lang="en" id="langEn"> English postings</label>
+          <label class="check"><input type="checkbox" data-lang="nl" id="langNl"> Dutch postings</label>
+          <label class="check"><input type="checkbox" data-lang="fr" id="langFr"> French postings</label>
+          <label class="check"><input type="checkbox" id="sHideFr"> Hide English and Dutch jobs that ask for French</label>
+        </div>
+
+        <h2>Sources</h2>
+        <div class="checks" id="sSources"></div>
+
+        <div class="form-actions"><button type="submit" id="saveSettings" class="btn primary">Save and re-score</button></div>
+      </form>
+
+      <aside class="settings-side">
+        <h2>Your CV</h2>
+        <p class="hint" id="cvPath"></p>
+        <p>Every job is scored against these skills from your CV. Replace CV.pdf with a newer version and this list updates by itself.</p>
+        <div id="cvSkills" class="skill-cloud"></div>
+
+        <h2>How a score is built</h2>
+        <div class="gauge legend" aria-hidden="true">
+          <span style="flex:40"><i style="width:100%"></i></span><span style="flex:30"><i style="width:100%"></i></span><span style="flex:15"><i style="width:100%"></i></span><span style="flex:15"><i style="width:100%"></i></span>
+        </div>
+        <dl class="weights">
+          <dt>40</dt><dd><b>Role.</b> Is the job title one of the roles your CV points to: security, full stack, IoT?</dd>
+          <dt>30</dt><dd><b>Skills.</b> How many of your skills the posting asks for. A related tool counts half, like Splunk when you know SIEM.</dd>
+          <dt>15</dt><dd><b>Coverage.</b> Of all skills the posting names, the share you have.</dd>
+          <dt>15</dt><dd><b>Distance.</b> From the nearest of your home towns. Remote or hybrid adds a bonus.</dd>
+        </dl>
+        <p class="hint">Senior or lead titles, internships and jobs asking far more years than you have score lower. Junior and medior titles score higher.</p>
+      </aside>
+    </div>
+  </section>
+</main>
+
+<!-- DETAIL DRAWER -->
+<div id="scrim" class="scrim" hidden></div>
+<aside id="drawer" class="drawer" hidden aria-label="Job details" tabindex="-1">
+  <button class="drawer-close" id="drawerClose" aria-label="Close details">Close</button>
+  <div id="drawerBody"></div>
+</aside>
+
+<div id="toast" class="toast" role="status" hidden></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

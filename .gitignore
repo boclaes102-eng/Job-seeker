@@ -1,0 +1,28 @@
+# --- Personal data: never commit ---------------------------------------------
+# Your CV, photo, job database and every tailored CV live here.
+data/
+CV.pdf
+*.pdf
+.env
+
+# --- Python -------------------------------------------------------------------
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- SQLite side files (if DATA_DIR is moved) ---------------------------------
+*.db
+*.db-wal
+*.db-shm
+
+# --- Editors / OS ---------------------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
