@@ -518,7 +518,9 @@ async function openJob(id) {
       ${job.url ? `<a class="btn primary" href="${esc(job.url)}" target="_blank" rel="noopener">${esc(applyLabel(job))}</a>` : ""}
       <a class="btn" href="${esc(searchElsewhereUrl(job))}" target="_blank" rel="noopener">Search for this job</a>
     </div>
-    <p class="hint">If the job site does not load, search for the same vacancy on the company's own site or another job board.</p>
+    <p class="hint">${job.source === "ictjob"
+      ? `If the ictjob page keeps loading, open <a href="https://www.ictjob.be/en" target="_blank" rel="noopener">ictjob.be</a> first, then try again. Its bot protection only lets job pages load once your browser has visited the site.`
+      : "If the job site does not load, search for the same vacancy on the company's own site or another job board."}</p>
 
     <h3 class="sec">Your application <span class="hint" id="trackSaved" aria-live="polite"></span></h3>
     <div class="tracking">
