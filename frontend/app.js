@@ -9,12 +9,14 @@ const STATUS_LABELS = {
 };
 const REC_LABELS = { strong_apply: "Strong match", apply: "Good match", maybe: "Worth a look", skip: "Weak match" };
 // Order and weight of the score parts, matching jobseeker/matching.py
-const PARTS = [["role", "Role", 40], ["skills", "Skills", 30], ["coverage", "Coverage", 15], ["location", "Distance", 15]];
+const PARTS = [["role", "Role", 35], ["skills", "Skills", 30], ["location", "Distance", 15],
+  ["coverage", "Coverage", 10], ["freshness", "Freshness", 10]];
 
 let appStatus = null;
 let pollTimer = null;
 let minGrade = "65";
 let statusFilter = "";
+let onlyNew = false;
 let openId = null;
 
 // ------------------------------------------------------------------ helpers
@@ -65,14 +67,55 @@ function scoreBlock(job) {
 }
 
 function sourceLabel(name) {
+  if (name === "manual") return "Added by you";
   return appStatus?.sources?.[name]?.label?.replace(/ \(.*\)$/, "") || name;
 }
+
+// "Apply on Jooble", or the site's own name for a job you added yourself
+function applyLabel(job) {
+  if (job.source !== "manual") return `Apply on ${sourceLabel(job.source)}`;
+  try { return `Apply on ${new URL(job.url).hostname.replace(/^www\./, "")}`; } catch (_) { return "Open posting"; }
+}
+
+const isNewToYou = (j) => Boolean(appStatus?.seen_until && j.fetched_at > appStatus.seen_until);
 
 function ago(iso) {
   if (!iso) return "";
   const days = Math.round((Date.now() - new Date(iso).getTime()) / 864e5);
   if (Number.isNaN(days)) return iso;
   return days <= 0 ? "today" : days === 1 ? "yesterday" : days < 30 ? `${days} days ago` : iso;
+}
+
+// Tracking dates are local calendar dates ("2026-11-06") or times ("2026-11-06T14:00").
+function localDate(iso) {
+  const [y, m, d] = iso.slice(0, 10).split("-").map(Number);
+  return new Date(y, m - 1, d);
+}
+function daysFrom(iso) {  // whole days from today; negative is in the past
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  return Math.round((localDate(iso) - today) / 864e5);
+}
+function rel(iso) {
+  const n = daysFrom(iso);
+  return n === 0 ? "today" : n === 1 ? "tomorrow" : n === -1 ? "yesterday" : n > 0 ? `in ${n} days` : `${-n} days ago`;
+}
+function fmtWhen(iso) {
+  const day = localDate(iso).toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" });
+  return iso.length > 10 ? `${day}, ${iso.slice(11, 16)}` : day;
+}
+const isTracked = (j) => j.status === "applied" || j.status === "interview";
+
+function trackLine(j) {
+  if (j.status === "interview" && j.interview_at) {
+    return `<div class="track">Interview ${esc(fmtWhen(j.interview_at))}, ${rel(j.interview_at)}</div>`;
+  }
+  if (!isTracked(j)) return "";
+  const bits = [];
+  if (j.applied_on) bits.push(`Applied ${rel(j.applied_on)}`);
+  if (j.follow_up_on) {
+    bits.push(daysFrom(j.follow_up_on) <= 0 ? `<b class="due">follow-up due</b>` : `follow up ${rel(j.follow_up_on)}`);
+  }
+  return bits.length ? `<div class="track">${bits.join(", ")}</div>` : "";
 }
 
 function skillList(items, cls, limit = 99) {
@@ -123,6 +166,7 @@ async function refreshStatus() {
        <span class="sub">Out of ${s.counts.total} English and Dutch jobs${s.counts.language_filtered ? `. ${s.counts.language_filtered} French jobs were left out` : ""}.</span>`
     : `No jobs yet. <span class="sub">Search now looks through ictjob.be, Jooble and Le Forem and scores every job against your CV.</span>`;
   renderPipeline(s.counts);
+  renderNewLine();
 
   const run = s.search;
   const prog = $("#progress");
@@ -151,11 +195,64 @@ function startPolling() {
     const s = await refreshStatus();
     if (!s.search.running) {
       clearInterval(pollTimer);
+      pollTimer = null;
       loadJobs();
-      toast("Search finished");
+      toast(s.search.new_jobs ? `Search finished: ${s.search.new_jobs} new jobs` : "Search finished, no new jobs");
+      lastUnseen = s.counts.unseen;
     }
   }, 1500);
 }
+
+// ---------------------------------------------------- found since last visit
+let lastUnseen = null;
+
+function renderNewLine() {
+  const n = appStatus.counts.unseen;
+  document.title = n ? `(${n}) Job Seeker` : "Job Seeker";
+  if (!n) onlyNew = false;
+  const el = $("#newLine");
+  el.hidden = !n;
+  el.innerHTML = n ? `
+    <span><b>${n}</b> ${n === 1 ? "job was" : "jobs were"} found since you last looked.</span>
+    <button class="btn quiet" data-act="only" aria-pressed="${onlyNew}">${onlyNew ? "Show all jobs" : "Show only these"}</button>
+    <button class="btn quiet" data-act="seen">Mark all as seen</button>` : "";
+}
+
+$("#newLine").addEventListener("click", async (ev) => {
+  const act = ev.target.closest("[data-act]")?.dataset.act;
+  if (act === "only") onlyNew = !onlyNew;
+  if (act === "seen") {
+    try { await api("/api/seen", { method: "POST" }); } catch (e) { toast(e.message, true); return; }
+    onlyNew = false;
+    await refreshStatus();
+    lastUnseen = 0;
+  }
+  if (act) { renderNewLine(); loadJobs(); }
+});
+
+function notifyEnabled() {
+  try { return localStorage.getItem("jobseeker.notify") === "1"; } catch (_) { return false; }
+}
+
+// Automatic searches run on the server; check now and then whether they found anything.
+async function checkForNewJobs() {
+  if (pollTimer || (document.hidden && !notifyEnabled())) return;
+  let s;
+  try { s = await refreshStatus(); } catch (_) { return; }
+  if (s.search.running) { startPolling(); return; }
+  const n = s.counts.unseen;
+  if (lastUnseen !== null && n > lastUnseen) {
+    const added = n - lastUnseen;
+    const msg = `${added} new ${added === 1 ? "job" : "jobs"} found`;
+    toast(msg);
+    if (notifyEnabled() && "Notification" in window && Notification.permission === "granted") {
+      new Notification("Job Seeker", { body: `${msg}. ${n} waiting for you to look at.` });
+    }
+    loadJobs();
+  }
+  lastUnseen = n;
+}
+setInterval(checkForNewJobs, 60_000);
 
 $("#searchBtn").addEventListener("click", async () => {
   try {
@@ -190,6 +287,7 @@ async function loadJobs() {
   if (minGrade) params.set("min_grade", minGrade);
   if ($("#fSource").value) params.set("source", $("#fSource").value);
   if (statusFilter) params.set("status", statusFilter);
+  if (onlyNew && appStatus?.seen_until) params.set("since", appStatus.seen_until);
   params.set("sort", $("#fSort").value);
   try {
     jobsCache = await api(`/api/jobs?${params}`);
@@ -214,13 +312,15 @@ function renderJobs() {
         ${scoreBlock(j)}
         <div class="job-main">
           <h3><button class="job-open" data-act="open">${esc(j.title)}</button>
+            ${isNewToYou(j) ? `<span class="tag t-fresh">Just found</span>` : ""}
             ${j.status !== "new" ? `<span class="tag t-${esc(j.status)}">${esc(STATUS_LABELS[j.status] || j.status)}</span>` : ""}</h3>
           <div class="who">${meta(j, [sourceLabel(j.source), ago(j.posted_at)])}</div>
+          ${trackLine(j)}
           ${g ? inlineSkills(g, 6) : ""}
         </div>
         ${distanceCell(g)}
         <div class="job-actions">
-          ${j.url ? `<a class="btn primary" href="${esc(j.url)}" target="_blank" rel="noopener" data-act="link">Apply on ${esc(sourceLabel(j.source))}</a>` : ""}
+          ${j.url ? `<a class="btn primary" href="${esc(j.url)}" target="_blank" rel="noopener" data-act="link">${esc(applyLabel(j))}</a>` : ""}
           <button class="btn quiet" data-act="${j.status === "saved" ? "unsave" : "save"}" aria-pressed="${j.status === "saved"}">${j.status === "saved" ? "Saved" : "Save"}</button>
           <button class="btn quiet" data-act="${j.status === "hidden" ? "unhide" : "hide"}">${j.status === "hidden" ? "Unhide" : "Hide"}</button>
         </div>
@@ -239,7 +339,7 @@ $("#jobList").addEventListener("click", async (ev) => {
     ev.stopPropagation();
     await api(`/api/jobs/${id}`, { method: "PATCH", body: { status: newStatus } });
     toast({ hidden: "Hidden", saved: "Saved", new: "Restored" }[newStatus]);
-    loadJobs(); refreshStatus();
+    loadJobs(); refreshStatus(); loadAgenda();
     return;
   }
   openJob(id);
@@ -264,6 +364,47 @@ $("#pipeline").addEventListener("click", (e) => {
   }
   renderPipeline(appStatus.counts);
   loadJobs();
+});
+
+// ------------------------------------------------------------------- agenda
+async function loadAgenda() {
+  let a;
+  try { a = await api("/api/agenda"); } catch (_) { return; }
+  const items = [
+    ...a.interviews.map((j) => `
+      <li class="ag ag-interview" data-id="${j.id}">
+        <span class="ag-when">${esc(fmtWhen(j.interview_at))}</span>
+        <span class="ag-body"><button class="ag-what" data-act="open">Interview at ${esc(j.company || j.title)}</button>
+          <span class="ag-sub">${esc(j.title)}, ${rel(j.interview_at)}</span></span>
+      </li>`),
+    ...a.follow_ups.map((j) => `
+      <li class="ag ag-follow" data-id="${j.id}">
+        <span class="ag-when">${daysFrom(j.follow_up_on) === 0 ? "Due today" : `Due ${rel(j.follow_up_on)}`}</span>
+        <span class="ag-body"><button class="ag-what" data-act="open">Follow up with ${esc(j.company || "the company")}</button>
+          <span class="ag-sub">${esc(j.title)}${j.applied_on ? `, applied ${rel(j.applied_on)}` : ""}</span></span>
+        <button class="btn" data-act="followed">I followed up</button>
+      </li>`),
+  ];
+  const el = $("#agenda");
+  el.hidden = !items.length;
+  el.innerHTML = items.length ? `<h2>Waiting on you</h2><ul>${items.join("")}</ul>` : "";
+}
+
+async function markFollowedUp(id) {
+  try {
+    const job = await api(`/api/jobs/${id}/followed-up`, { method: "POST" });
+    toast(`Noted. Next follow-up ${fmtWhen(job.follow_up_on)}.`);
+    loadAgenda(); loadJobs();
+    return job;
+  } catch (e) { toast(e.message, true); }
+}
+
+$("#agenda").addEventListener("click", (ev) => {
+  const act = ev.target.closest("[data-act]")?.dataset.act;
+  const id = Number(ev.target.closest(".ag")?.dataset.id);
+  if (!act || !id) return;
+  if (act === "open") openJob(id);
+  if (act === "followed") markFollowedUp(id);
 });
 
 let filterTimer;
@@ -292,6 +433,32 @@ function closeDrawer() {
 $("#drawerClose").addEventListener("click", closeDrawer);
 $("#scrim").addEventListener("click", closeDrawer);
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeDrawer(); });
+
+// Update the tracking inputs from the server copy, leaving the one being typed in alone.
+function fillTracking(job) {
+  document.querySelectorAll("[data-track]").forEach((el) => {
+    if (document.activeElement !== el) el.value = job[el.dataset.track] || "";
+  });
+  $("#jobStatus").value = job.status;
+  $("#followedUp").hidden = !isTracked(job);
+}
+
+function savedHint() {
+  const el = $("#trackSaved");
+  if (!el) return;
+  el.textContent = "Saved";
+  clearTimeout(el._timer);
+  el._timer = setTimeout(() => { el.textContent = ""; }, 2000);
+}
+
+async function saveJob(id, body) {
+  try {
+    const job = await api(`/api/jobs/${id}`, { method: "PATCH", body });
+    if (openId === id) fillTracking(job);
+    loadJobs(); refreshStatus(); loadAgenda();
+    return job;
+  } catch (e) { toast(e.message, true); return null; }
+}
 
 function breakdown(g, total) {
   const points = PARTS.map(([k, , w]) => Math.round((g.parts[k] ?? 0) * w));
@@ -341,16 +508,26 @@ async function openJob(id) {
         ? `<p class="hint">The text from the job site names no specific skills. Paste the full posting below for a better score.</p>` : ""}
     </div>` : ""}
 
-    <div class="actions">
-      ${job.url ? `<a class="btn primary" href="${esc(job.url)}" target="_blank" rel="noopener">Apply on ${esc(sourceLabel(job.source))}</a>` : ""}
-      <label class="status-pick"><span class="hint">Status</span><select id="jobStatus">${statusOptions}</select></label>
+    ${job.url ? `<div class="actions">
+      <a class="btn primary" href="${esc(job.url)}" target="_blank" rel="noopener">${esc(applyLabel(job))}</a>
+    </div>` : ""}
+
+    <h3 class="sec">Your application <span class="hint" id="trackSaved" aria-live="polite"></span></h3>
+    <div class="tracking">
+      <label>Status<select id="jobStatus">${statusOptions}</select></label>
+      <label>Applied on<input type="date" data-track="applied_on"></label>
+      <label>Follow up on
+        <span class="with-btn"><input type="date" data-track="follow_up_on"><button class="btn" type="button" id="followedUp">I followed up</button></span></label>
+      <label>Interview<input type="datetime-local" data-track="interview_at"></label>
+      <label class="wide">Contact<input type="text" data-track="contact" placeholder="Recruiter name, email or phone"></label>
+      <label class="wide">Notes<textarea data-track="notes" rows="4" placeholder="What you sent, who you spoke to, what they asked"></textarea></label>
     </div>
 
     <h3 class="sec">Description${job.full_description ? "" : ", short version from the job site"}</h3>
     <div class="desc">${esc(job.full_description || job.description || "No description available.")}</div>
 
     <h3 class="sec">Get a more accurate score</h3>
-    <p class="hint">Job sites only share a snippet. Paste the full posting text, or fetch it, and the job is scored again on the complete text.</p>
+    <p class="hint">Job sites only share a snippet. Open the posting and click <b>Send to Job Seeker</b> in your bookmarks bar, or paste the text here. The job is then scored on the complete text.</p>
     <textarea id="fullDesc" rows="6" placeholder="Paste the full job description here" aria-label="Full job description">${esc(job.full_description || "")}</textarea>
     <div class="actions">
       <button class="btn primary" id="rescoreBtn">Score this text</button>
@@ -358,10 +535,31 @@ async function openJob(id) {
     </div>
   `);
 
+  fillTracking(job);
+
   $("#jobStatus").addEventListener("change", async (e) => {
-    await api(`/api/jobs/${id}`, { method: "PATCH", body: { status: e.target.value } });
-    toast(`Marked as ${STATUS_LABELS[e.target.value].toLowerCase()}`);
-    loadJobs(); refreshStatus();
+    const updated = await saveJob(id, { status: e.target.value });
+    if (!updated) return;
+    const followUp = updated.status === "applied" && !job.follow_up_on && updated.follow_up_on;
+    toast(`Marked as ${STATUS_LABELS[updated.status].toLowerCase()}.` +
+      (followUp ? ` Follow-up set for ${fmtWhen(updated.follow_up_on)}.` : ""));
+    job = updated;
+  });
+
+  let notesTimer;
+  document.querySelectorAll("[data-track]").forEach((el) => {
+    const save = () => saveJob(id, { [el.dataset.track]: el.value }).then((j) => { if (j) savedHint(); });
+    if (el.tagName === "TEXTAREA" || el.type === "text") {
+      el.addEventListener("input", () => { clearTimeout(notesTimer); notesTimer = setTimeout(save, 800); });
+      el.addEventListener("blur", () => { clearTimeout(notesTimer); save(); });
+    } else {
+      el.addEventListener("change", save);
+    }
+  });
+
+  $("#followedUp").addEventListener("click", async () => {
+    const updated = await markFollowedUp(id);
+    if (updated) fillTracking(updated);
   });
 
   $("#fetchDesc").addEventListener("click", async (e) => {
@@ -388,7 +586,141 @@ async function openJob(id) {
   });
 }
 
+// ------------------------------------------------- add a job / bookmarklet
+// The bookmarklet runs on the job page, opens this app with ?add=1 and posts the
+// page to it with postMessage. Nothing is saved until you press the button.
+function findPosting(x) {
+  if (Array.isArray(x)) {
+    for (const item of x) { const found = findPosting(item); if (found) return found; }
+  } else if (x && typeof x === "object") {
+    const t = x["@type"];
+    if (t === "JobPosting" || (Array.isArray(t) && t.includes("JobPosting"))) return x;
+    for (const k of ["@graph", "mainEntity", "itemListElement"]) {
+      if (x[k]) { const found = findPosting(x[k]); if (found) return found; }
+    }
+  }
+  return null;
+}
+
+function htmlToText(html) {
+  const doc = new DOMParser().parseFromString(String(html), "text/html");  // parsing only, scripts never run
+  doc.querySelectorAll("br").forEach((b) => b.replaceWith("\n"));
+  doc.querySelectorAll("p, li, h1, h2, h3, h4, div").forEach((el) => el.append("\n"));
+  return doc.body.textContent.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function fromPage(d) {
+  let posting = null;
+  for (const raw of d.ld || []) {
+    try { posting = findPosting(JSON.parse(raw)); } catch (_) { /* not JSON */ }
+    if (posting) break;
+  }
+  // "(3) Full Stack Developer | Acme | LinkedIn" -> title and company
+  const parts = String(d.title || "").replace(/^\(\d+\)\s*/, "").split(" | ").map((p) => p.trim());
+  const org = posting?.hiringOrganization;
+  const places = [].concat(posting?.jobLocation || []);
+  const town = places.map((p) => p?.address?.addressLocality).filter(Boolean).join(", ");
+  const ldText = posting?.description ? htmlToText(posting.description) : "";
+  return {
+    url: d.url,
+    title: posting?.title || parts[0] || "",
+    company: (typeof org === "string" ? org : org?.name) || (parts.length >= 3 ? parts[1] : ""),
+    location: posting?.jobLocationType === "TELECOMMUTE" ? "Remote" : town,
+    posted_at: String(posting?.datePosted || "").slice(0, 10),
+    text: ldText.length > 200 ? ldText : String(d.text || "").trim(),
+  };
+}
+
+function waitForSentPage() {
+  history.replaceState(null, "", location.pathname);
+  openDrawer(`<h2>Add a job</h2><p class="hint">Receiving the job page…</p>`);
+  const timer = setTimeout(() => {
+    removeEventListener("message", onMessage);
+    showAddForm({});
+    toast("Nothing arrived from the job page. Paste the posting here instead.", true);
+  }, 15000);
+  function onMessage(e) {
+    if (e.data?.type !== "jobseeker-import") return;
+    e.source?.postMessage("jobseeker-ok", e.origin);
+    removeEventListener("message", onMessage);
+    clearTimeout(timer);
+    showAddForm(fromPage(e.data));
+  }
+  addEventListener("message", onMessage);
+}
+
+async function showAddForm(p, allowMatch = true) {
+  let match = null;
+  if (allowMatch && (p.url || p.title)) {
+    try { match = (await api("/api/jobs/match", { method: "POST", body: { url: p.url, title: p.title, company: p.company } })).job; }
+    catch (_) { /* treat as new */ }
+  }
+  const field = (name, label, value, attrs = "") =>
+    `<label>${label}<input name="${name}" value="${esc(value || "")}" ${attrs}></label>`;
+  openDrawer(`
+    <h2>${match ? "Update a job in your list" : "Add a job"}</h2>
+    ${match ? `<p class="match-note">This is <b>${esc(match.title)}</b>${match.company ? ` at ${esc(match.company)}` : ""}, already in your list.
+      The text below replaces its short snippet and the job is scored again.
+      <button class="btn quiet" type="button" id="addSeparate">Add it as a separate job</button></p>` : ""}
+    <form class="add-form" id="addForm">
+      ${match ? "" : `
+        ${field("title", "Job title", p.title, "required")}
+        ${field("company", "Company", p.company)}
+        ${field("location", "Location", p.location, 'placeholder="Town, or Remote"')}
+        ${field("url", "Link to the posting", p.url, 'type="url" placeholder="https://"')}`}
+      ${field("posted_at", "Posted on", p.posted_at, 'type="date"')}
+      <label class="wide">Full posting text
+        <textarea name="text" rows="14" required placeholder="Paste the whole job description">${esc(p.text || "")}</textarea></label>
+      <p class="hint wide">If the page showed more than one job, check that this is only the job you want. Selecting its text before you click the bookmarklet sends just that.</p>
+      <div class="actions wide"><button class="btn primary" type="submit">${match ? "Update and score" : "Add and score"}</button></div>
+    </form>`);
+  $("#addSeparate")?.addEventListener("click", () => showAddForm(p, false));
+  $("#addForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const form = Object.fromEntries(new FormData(e.currentTarget));
+    const body = match ? { ...form, title: match.title, job_id: match.id } : { ...form };
+    try {
+      const r = await api("/api/jobs/import", { method: "POST", body });
+      toast(`${r.created ? "Added" : "Updated"} and scored: ${r.job.grade ?? "no score"}`);
+      refreshStatus(); loadJobs();
+      openJob(r.job.id);
+    } catch (err) { toast(err.message, true); }
+  });
+}
+
+$("#addBtn").addEventListener("click", () => showAddForm({}, false));
+
+function bookmarkletHref(origin) {
+  const code = `(()=>{const A=${JSON.stringify(origin)};const s=String(getSelection()).trim();`
+    + `const m=document.querySelector('main,article,[role=main]')||document.body;`
+    + `const d={type:'jobseeker-import',url:location.href,title:document.title,`
+    + `ld:[...document.querySelectorAll('script[type="application/ld+json"]')].map(x=>x.textContent),`
+    + `text:(s.length>200?s:m.innerText).slice(0,30000)};`
+    + `const w=window.open(A+'/?add=1','jobseeker');`
+    + `if(!w){alert('Allow pop-ups for this site to send jobs to Job Seeker.');return}`
+    + `let n=0;const t=setInterval(()=>{try{w.postMessage(d,A)}catch(e){}if(++n>60)clearInterval(t)},250);`
+    + `addEventListener('message',e=>{if(e.origin===A&&e.data==='jobseeker-ok')clearInterval(t)})})()`;
+  return "javascript:" + encodeURIComponent(code);
+}
+
 // ----------------------------------------------------------------- settings
+$("#bookmarklet").href = bookmarkletHref(location.origin);
+$("#bookmarklet").addEventListener("click", (e) => {
+  e.preventDefault();
+  toast("Drag this button to your bookmarks bar, then click it on a job page.");
+});
+
+$("#notifyNew").checked = notifyEnabled();
+$("#notifyNew").addEventListener("change", async (e) => {
+  let on = e.target.checked;
+  if (on && "Notification" in window && Notification.permission !== "granted") {
+    on = (await Notification.requestPermission()) === "granted";
+    if (!on) toast("Your browser blocked notifications for this page. Allow them in its site settings.", true);
+  }
+  e.target.checked = on;
+  try { localStorage.setItem("jobseeker.notify", on ? "1" : "0"); } catch (_) { /* private window */ }
+});
+
 async function loadSettings() {
   try {
     const s = await api("/api/settings");
@@ -443,10 +775,14 @@ $("#settingsForm").addEventListener("submit", async (e) => {
       minGrade = "";
       document.querySelectorAll("#fGradeSeg button").forEach((x) => x.classList.toggle("on", x.dataset.min === ""));
     }
+    lastUnseen = s.counts.unseen;
     if (s.search.running) startPolling();
     if (!s.cv_loaded) toast("CV.pdf was not found in the project folder.", true);
   } catch (e) { toast("Cannot reach the app server: " + e.message, true); }
+  const query = new URLSearchParams(location.search);
+  if (query.has("add")) waitForSentPage();  // opened by the bookmarklet: listen before anything slow
+  loadAgenda();
   await loadJobs();
-  const linked = Number(new URLSearchParams(location.search).get("job"));  // ?job=123 opens that job
+  const linked = Number(query.get("job"));  // ?job=123 opens that job
   if (linked) openJob(linked);
 })();

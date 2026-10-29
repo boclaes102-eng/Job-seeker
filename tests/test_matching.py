@@ -9,7 +9,7 @@ CV = CVProfile(
     mtime=0,
 )
 SETTINGS = dict(DEFAULT_SETTINGS)
-WEIGHTS = {"role": 40, "skills": 30, "coverage": 15, "location": 15}
+WEIGHTS = {"role": 35, "skills": 30, "coverage": 10, "location": 15, "freshness": 10}
 
 
 def job(title, description="", location="Antwerpen"):
@@ -52,3 +52,25 @@ def test_score_shape():
     assert 0 <= g["score"] <= 100
     assert g["recommendation"] in {"strong_apply", "apply", "maybe", "skip"}
     assert g["distance_km"] is not None
+
+
+def test_freshness_drops_with_age():
+    from datetime import date
+
+    from jobseeker.matching import freshness
+    today = date(2026, 10, 29)
+    assert freshness("2026-10-28", today) == (1.0, 1)
+    assert freshness("2026-10-20", today)[0] == 0.7
+    assert freshness("2026-09-01", today)[0] == 0.15
+    assert freshness(None, today) == (0.6, None)
+    assert freshness("not a date", today) == (0.6, None)
+
+
+def test_fresh_job_beats_old_one():
+    from datetime import date, timedelta
+    text = "Pentesting, OWASP, Python."
+    fresh = score_job({**job("Security Engineer", text), "posted_at": date.today().isoformat()}, CV, SETTINGS)
+    old = score_job({**job("Security Engineer", text),
+                     "posted_at": (date.today() - timedelta(days=40)).isoformat()}, CV, SETTINGS)
+    assert fresh["score"] > old["score"]
+    assert "may already be filled" in old["summary"]

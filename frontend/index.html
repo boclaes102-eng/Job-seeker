@@ -22,6 +22,7 @@
     </nav>
     <div class="masthead-right">
       <div class="sources" id="pills" aria-label="Job sources"></div>
+      <button id="addBtn" class="btn">Add a job</button>
       <button id="searchBtn" class="btn primary">Search now</button>
     </div>
   </div>
@@ -37,6 +38,9 @@
   <!-- JOBS -->
   <section id="tab-jobs" class="tab-panel">
     <h1 class="summary-line" id="counts"></h1>
+    <div class="new-line" id="newLine" hidden></div>
+
+    <section class="agenda" id="agenda" aria-label="Follow-ups and interviews" hidden></section>
 
     <nav class="pipeline" id="pipeline" aria-label="Filter by status"></nav>
 
@@ -102,6 +106,17 @@
       </form>
 
       <aside class="settings-side">
+        <h2>Send jobs from your browser</h2>
+        <p>Drag this button to your bookmarks bar. Then click it on any job page, on LinkedIn, a company site or a job board, to add that job. If the job is already in your list, it gets the full posting text and is scored again.</p>
+        <p><a class="btn primary bookmarklet" id="bookmarklet" href="#">Send to Job Seeker</a></p>
+        <p class="hint">If a page shows several jobs, select the text of the one you want first. Allow pop-ups when your browser asks.</p>
+
+        <h2>New jobs</h2>
+        <div class="checks">
+          <label class="check"><input type="checkbox" id="notifyNew"> Show a desktop notification when a search finds new jobs</label>
+        </div>
+        <p class="hint">Works while Job Seeker is open in a browser tab. Set AUTO_SEARCH_HOURS in .env to search on a schedule.</p>
+
         <h2>Your CV</h2>
         <p class="hint" id="cvPath"></p>
         <p>Every job is scored against these skills from your CV. Replace CV.pdf with a newer version and this list updates by itself.</p>
@@ -109,13 +124,14 @@
 
         <h2>How a score is built</h2>
         <div class="gauge legend" aria-hidden="true">
-          <span style="flex:40"><i style="width:100%"></i></span><span style="flex:30"><i style="width:100%"></i></span><span style="flex:15"><i style="width:100%"></i></span><span style="flex:15"><i style="width:100%"></i></span>
+          <span style="flex:35"><i style="width:100%"></i></span><span style="flex:30"><i style="width:100%"></i></span><span style="flex:15"><i style="width:100%"></i></span><span style="flex:10"><i style="width:100%"></i></span><span style="flex:10"><i style="width:100%"></i></span>
         </div>
         <dl class="weights">
-          <dt>40</dt><dd><b>Role.</b> Is the job title one of the roles your CV points to: security, full stack, IoT?</dd>
+          <dt>35</dt><dd><b>Role.</b> Is the job title one of the roles your CV points to: security, full stack, IoT?</dd>
           <dt>30</dt><dd><b>Skills.</b> How many of your skills the posting asks for. A related tool counts half, like Splunk when you know SIEM.</dd>
-          <dt>15</dt><dd><b>Coverage.</b> Of all skills the posting names, the share you have.</dd>
           <dt>15</dt><dd><b>Distance.</b> From the nearest of your home towns. Remote or hybrid adds a bonus.</dd>
+          <dt>10</dt><dd><b>Coverage.</b> Of all skills the posting names, the share you have.</dd>
+          <dt>10</dt><dd><b>Freshness.</b> How long ago the job was posted. Full points in the first 3 days, then less each week. After 3 weeks a job may already be filled.</dd>
         </dl>
         <p class="hint">Senior or lead titles, internships and jobs asking far more years than you have score lower. Junior and medior titles score higher.</p>
       </aside>

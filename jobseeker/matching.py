@@ -1,7 +1,7 @@
 """Score how well a job fits your CV, fully offline (no AI service, no cost).
 
-score (0-100) = 40% role fit + 30% skill match + 15% skill coverage + 15% location,
-then adjusted for seniority, required years of experience and internships.
+score (0-100) = 35% role fit + 30% skill match + 10% skill coverage + 15% location
++ 10% freshness, then adjusted for seniority, required years of experience and internships.
 
 - role fit: is the job title one of the roles your CV points to (security,
   full stack, IoT, ...)?
@@ -9,11 +9,13 @@ then adjusted for seniority, required years of experience and internships.
   importance. A related tool counts half (Splunk when you know SIEM).
 - skill coverage: of all the skills the posting names, how many you have.
 - location: distance from the nearest of your home towns; remote/hybrid is a bonus.
+- freshness: how long ago the job was posted. Old postings are often filled already.
 """
 from __future__ import annotations
 
 import math
 import re
+from datetime import date
 from typing import Any
 
 from . import db
@@ -98,6 +100,21 @@ def _role_fit(title: str, body: str) -> tuple[float, str]:
     return best
 
 
+# (max age in days, score): applying in the first week matters most.
+_FRESHNESS = [(3, 1.0), (7, 0.9), (14, 0.7), (21, 0.5), (30, 0.3)]
+STALE_AFTER_DAYS = 21
+
+
+def freshness(posted_at: str | None, today: date | None = None) -> tuple[float, int | None]:
+    """Score for how recently a job was posted, and its age in days (None if unknown)."""
+    try:
+        posted = date.fromisoformat((posted_at or "")[:10])
+    except ValueError:
+        return 0.6, None  # unknown date: neither fresh nor stale
+    days = max(0, ((today or date.today()) - posted).days)
+    return next((s for limit, s in _FRESHNESS if days <= limit), 0.15), days
+
+
 def home_places(settings: dict[str, Any]) -> list[tuple[str, tuple[float, float]]]:
     """Your home towns that could be located, e.g. [("Langdorp", ...), ("Antwerp", ...)]."""
     homes = [(name, locate(name)) for name in settings.get("home_towns") or ["Langdorp"]]
@@ -168,7 +185,9 @@ def score_job(job: dict[str, Any], cv: CVProfile, settings: dict[str, Any]) -> d
     loc_score, km, mode, nearest_home = _location_score(
         job.get("location"), text, homes, float(settings.get("max_distance_km", 60)))
 
-    score = 100 * (0.40 * role + 0.30 * skill_score + 0.15 * coverage + 0.15 * loc_score)
+    fresh, age_days = freshness(job.get("posted_at"))
+
+    score = 100 * (0.35 * role + 0.30 * skill_score + 0.10 * coverage + 0.15 * loc_score + 0.10 * fresh)
 
     # --- seniority & requirements
     notes, dealbreakers = [], []
@@ -219,6 +238,8 @@ def score_job(job: dict[str, Any], cv: CVProfile, settings: dict[str, Any]) -> d
         summary += " The posting text names no specific skills; open it to judge."
     if notes:
         summary += " " + "; ".join(notes) + "."
+    if age_days is not None and age_days > STALE_AFTER_DAYS:
+        summary += f" Posted {age_days} days ago, so it may already be filled."
 
     return {
         "score": score,
@@ -235,7 +256,9 @@ def score_job(job: dict[str, Any], cv: CVProfile, settings: dict[str, Any]) -> d
         "work_mode": mode,
         "role": role_label,
         "parts": {"role": round(role, 2), "skills": round(skill_score, 2),
-                  "coverage": round(coverage, 2), "location": round(loc_score, 2)},
+                  "coverage": round(coverage, 2), "location": round(loc_score, 2),
+                  "freshness": round(fresh, 2)},
+        "age_days": age_days,
     }
 
 

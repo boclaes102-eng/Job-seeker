@@ -68,7 +68,7 @@ def run_search() -> dict[str, Any]:
             _set(progress=i, new_jobs=len(new_ids), message=f"Fetched {i}/{len(tasks)} searches")
 
     _set(phase="scoring", message="Scoring jobs against your CV...")
-    score_jobs(new_ids)
+    score_jobs()  # all of them: freshness changes every day, not only for new jobs
 
     counts = db.job_counts()
     _set(phase="done", message=(
