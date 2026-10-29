@@ -15,16 +15,18 @@ It runs entirely on your own computer. There is no AI service, no subscription a
    - which skills you don't have;
    - how far it is from home;
    - an **Apply** link to the original posting.
-5. **Track.** Mark jobs as saved, applied, interview, rejected or hidden.
+5. **Track.** Mark jobs as saved, applied, interview, rejected or hidden. Marking a job applied sets today's date and a follow-up a week later. Due follow-ups and upcoming interviews show at the top of the page under **Waiting on you**.
+6. **Tell you what's new.** Jobs found since you last looked are marked **Just found**, and the browser tab shows how many there are. Turn on desktop notifications under **Settings → New jobs**.
 
 ### How the score works
 
 | Part | Weight | What it measures |
 |---|---|---|
-| Role | 40% | Is the job title one of the roles your CV points to? Security, pentesting and SOC rank highest, then full stack, IoT/embedded, development and infrastructure. |
+| Role | 35% | Is the job title one of the roles your CV points to? Security, pentesting and SOC rank highest, then full stack, IoT/embedded, development and infrastructure. |
 | Skills | 30% | How many of your CV skills the posting asks for, weighted by importance. A related tool counts half, for example Splunk when your CV says SIEM. |
-| Coverage | 15% | Of all the skills the posting names, how many you have. |
 | Location | 15% | Distance from the nearest of your home towns (Langdorp and Antwerp by default). Remote or hybrid work is a bonus. |
+| Coverage | 10% | Of all the skills the posting names, how many you have. |
+| Freshness | 10% | How long ago the job was posted: full points in the first 3 days, then less each week. Jobs older than 3 weeks are flagged as possibly filled. |
 
 Some things change the score after that:
 - **Lower:** senior, lead and manager titles; internships; jobs that ask many more years of experience than you have.
@@ -32,7 +34,13 @@ Some things change the score after that:
 
 Score labels: **80+** strong match, **65+** good match, **45+** worth a look.
 
-Job sites only share a short snippet of each posting. Open a job and paste the full posting text, or click **Try to fetch full description**. The job is then re-scored on the complete text.
+Job sites only share a short snippet of each posting, so scores are much better on the full text. There are three ways to give a job its full text:
+
+- **Send to Job Seeker** (recommended). Drag the button from **Settings → Send jobs from your browser** to your bookmarks bar. Open any job page and click it. Job Seeker opens with the posting filled in. If the job is already in your list, it gets the full text. Otherwise you can add it as a new job, which also works for LinkedIn, company career pages and jobs a friend sends you. The page is read by your own browser, so sites that block bots still work.
+- **Paste** the posting text into a job's details panel.
+- **Fetch from the job site**. This often fails: ictjob, Jooble and Le Forem all block or need a full browser.
+
+**Add a job** in the header opens the same form empty, for typing or pasting a job in by hand.
 
 ## Job sources
 

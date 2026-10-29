@@ -9,6 +9,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from .config import CONFIG
 from .language import detect_language, mentions_french
@@ -35,6 +36,11 @@ CREATE TABLE IF NOT EXISTS jobs (
     status           TEXT NOT NULL DEFAULT 'new',
     language         TEXT,
     requires_french  INTEGER NOT NULL DEFAULT 0,
+    applied_on       TEXT,
+    follow_up_on     TEXT,
+    interview_at     TEXT,
+    contact          TEXT,
+    notes            TEXT,
     UNIQUE (source, external_id)
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_dedup ON jobs (dedup_key);
@@ -74,8 +80,21 @@ DEFAULT_SETTINGS: dict[str, Any] = {
 JOB_STATUSES = {"new", "saved", "applied", "interview", "rejected", "hidden"}
 
 
+# What you record about your own application. Dates are YYYY-MM-DD, interview_at YYYY-MM-DDTHH:MM.
+TRACKING_FIELDS = ("applied_on", "follow_up_on", "interview_at", "contact", "notes")
+FOLLOW_UP_AFTER_DAYS = 7  # a sensible first nudge when a company has not replied
+
+
 def now_iso() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat()
+
+
+def now_precise() -> str:
+    """Like now_iso, to the microsecond: for "found since you last looked", where a second is too coarse.
+
+    Sorts correctly against older second-only stamps ("...:02+00:00" < "...:02.5+00:00").
+    """
+    return datetime.now(UTC).isoformat()
 
 
 @contextmanager
@@ -98,11 +117,33 @@ def init_db() -> None:
             conn.execute("ALTER TABLE jobs ADD COLUMN language TEXT")
         if cols and "requires_french" not in cols:
             conn.execute("ALTER TABLE jobs ADD COLUMN requires_french INTEGER NOT NULL DEFAULT 0")
+        for col in TRACKING_FIELDS:
+            if cols and col not in cols:
+                conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} TEXT")
         conn.executescript(SCHEMA)
         conn.execute("UPDATE jobs SET status = 'saved' WHERE status = 'cv_generated'")
         for r in conn.execute("SELECT * FROM jobs WHERE language IS NULL").fetchall():
             lang, fr = classify_language(dict(r))
             conn.execute("UPDATE jobs SET language = ?, requires_french = ? WHERE id = ?", (lang, fr, r["id"]))
+        # Jobs already in the database count as seen; only later finds are marked new.
+        conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('seen_until', ?)",
+                     (json.dumps(now_precise()),))
+
+
+# ------------------------------------------------------- since last visit
+def seen_until() -> str:
+    """Jobs first found after this moment are new to you."""
+    with connect() as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key = 'seen_until'").fetchone()
+    return json.loads(row["value"]) if row else now_precise()
+
+
+def mark_seen() -> str:
+    stamp = now_precise()
+    with connect() as conn:
+        conn.execute("INSERT INTO settings (key, value) VALUES ('seen_until', ?) "
+                     "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (json.dumps(stamp),))
+    return stamp
 
 
 # ---------------------------------------------------------------- settings
@@ -213,7 +254,7 @@ def upsert_job(job: dict[str, Any]) -> tuple[int | None, bool]:
             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (job["source"], job["external_id"], dedup, job["title"], job.get("company"),
              job.get("location"), job.get("url"), job.get("description"), job.get("contract"),
-             job.get("salary"), job.get("posted_at"), now_iso(), lang, requires_fr),
+             job.get("salary"), job.get("posted_at"), now_precise(), lang, requires_fr),
         )
         return cur.lastrowid, True
 
@@ -230,6 +271,7 @@ def list_jobs(
     source: str | None = None,
     min_grade: int | None = None,
     q: str | None = None,
+    since: str | None = None,
     sort: str = "grade",
     limit: int = 500,
 ) -> list[dict[str, Any]]:
@@ -250,6 +292,9 @@ def list_jobs(
     if q:
         where.append("(title LIKE ? OR company LIKE ? OR description LIKE ? OR location LIKE ?)")
         params.extend([f"%{q}%"] * 4)
+    if since:
+        where.append("fetched_at > ?")
+        params.append(since)
     order = {
         "grade": "grade IS NULL, grade DESC, posted_at DESC",
         "date": "posted_at IS NULL, posted_at DESC, grade DESC",
@@ -262,7 +307,9 @@ def list_jobs(
 
 
 def update_job(job_id: int, **fields: Any) -> None:
-    allowed = {"status", "full_description", "grade", "grade_json", "graded_at", "language", "requires_french"}
+    allowed = {"status", "full_description", "posted_at", "grade", "grade_json", "graded_at", "language",
+               "requires_french",
+               *TRACKING_FIELDS}
     sets = {k: v for k, v in fields.items() if k in allowed}
     if not sets:
         return
@@ -271,6 +318,23 @@ def update_job(job_id: int, **fields: Any) -> None:
     cols = ", ".join(f"{k} = ?" for k in sets)
     with connect() as conn:
         conn.execute(f"UPDATE jobs SET {cols} WHERE id = ?", (*sets.values(), job_id))
+
+
+def agenda(today: str) -> dict[str, list[dict[str, Any]]]:
+    """What needs your attention: follow-ups that are due and interviews still to come.
+
+    Not language-filtered: these are jobs you chose to apply to.
+    """
+    with connect() as conn:
+        due = conn.execute(
+            "SELECT * FROM jobs WHERE status IN ('applied', 'interview') AND follow_up_on IS NOT NULL "
+            "AND follow_up_on <= ? ORDER BY follow_up_on", (today,),
+        ).fetchall()
+        interviews = conn.execute(
+            "SELECT * FROM jobs WHERE status = 'interview' AND interview_at IS NOT NULL "
+            "AND substr(interview_at, 1, 10) >= ? ORDER BY interview_at", (today,),
+        ).fetchall()
+    return {"follow_ups": [_row_to_job(r) for r in due], "interviews": [_row_to_job(r) for r in interviews]}
 
 
 def all_jobs() -> list[dict[str, Any]]:
@@ -290,6 +354,49 @@ def job_counts() -> dict[str, int]:
         by_status = dict(conn.execute(
             f"SELECT status, COUNT(*) FROM jobs WHERE {lang_sql} GROUP BY status", lang_params,
         ).fetchall())
+        unseen = conn.execute(
+            f"SELECT COUNT(*) FROM jobs WHERE status != 'hidden' AND {lang_sql} AND fetched_at > ?",
+            [*lang_params, seen_until()],
+        ).fetchone()[0]
     return {"total": row[0] or 0, "good": row[1] or 0, "strong": row[2] or 0,
-            "language_filtered": filtered or 0,
+            "language_filtered": filtered or 0, "unseen": unseen or 0,
             "by_status": {s: by_status.get(s, 0) for s in JOB_STATUSES}}
+
+
+# ------------------------------------------------------ jobs you add yourself
+_TRACKING_PARAMS = {"ckey", "refid", "trackingid", "ref", "src", "source", "origin", "gclid", "fbclid"}
+
+
+def canonical_url(url: str | None) -> str:
+    """The same posting reached through different links gives the same URL.
+
+    Drops the #fragment and tracking parameters, and turns a LinkedIn search page
+    showing one job (?currentJobId=123) into that job's own page.
+    """
+    if not url:
+        return ""
+    parts = urlsplit(url.strip())
+    query = [(k, v) for k, v in parse_qsl(parts.query)
+             if not k.lower().startswith("utm_") and k.lower() not in _TRACKING_PARAMS]
+    host = parts.netloc.lower()
+    if host.endswith("linkedin.com"):
+        in_path = re.search(r"/jobs/view/(?:[^/]*-)?(\d+)", parts.path)
+        job_id = dict(query).get("currentJobId") or (in_path and in_path.group(1))
+        if job_id:
+            return f"https://www.linkedin.com/jobs/view/{job_id}/"
+    return urlunsplit((parts.scheme.lower(), host, parts.path.rstrip("/") or "/", urlencode(sorted(query)), ""))
+
+
+def find_match(url: str | None, title: str | None, company: str | None) -> dict[str, Any] | None:
+    """A job already in the database that is this posting: same link, or same title and company."""
+    key = canonical_url(url)
+    with connect() as conn:
+        if key:
+            for r in conn.execute("SELECT * FROM jobs WHERE url IS NOT NULL").fetchall():
+                if canonical_url(r["url"]) == key:
+                    return _row_to_job(r)
+        if title:
+            r = conn.execute("SELECT * FROM jobs WHERE dedup_key = ?", (make_dedup_key(title, company),)).fetchone()
+            if r:
+                return _row_to_job(r)
+    return None
